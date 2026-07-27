@@ -340,6 +340,23 @@ contract DIAVaultOracleTest is Test {
         assertEq(oracle.version(), 1);
     }
 
+    /// @notice `description()` deliberately returns the BARE DIA feed symbol
+    /// (e.g. `"COIN"`), NOT a Chainlink-style `"SYMBOL / USD"` pair string
+    /// (issue #274). This pins that intentional deviation: the value must be
+    /// the raw configured symbol byte-for-byte, and must NOT equal the
+    /// pair-formatted `"COIN / USD"` a Chainlink consumer might assume. A
+    /// regression that pair-formatted the description would fail here, and the
+    /// interface NatSpec is worded to permit this so the two don't clash.
+    function testDescriptionReturnsBareSymbolNotPairString() external {
+        DIAVaultOracle oracle = _deployProxy(_defaultConfig());
+        string memory desc = oracle.description();
+        assertEq(desc, SYMBOL, "description must be the bare DIA symbol");
+        assertTrue(
+            keccak256(bytes(desc)) != keccak256(bytes(string.concat(SYMBOL, " / USD"))),
+            "description must NOT be a Chainlink-style pair string"
+        );
+    }
+
     // -------- latestAnswer happy path --------
 
     function testLatestAnswerHappyPath() external {
@@ -353,6 +370,36 @@ contract DIAVaultOracleTest is Test {
         // 100 * 2 / 1 = 200, scaled to 8dp = 200e8.
         int256 answer = oracle.latestAnswer();
         assertEq(answer, int256(200e8));
+    }
+
+    /// @notice Donation / share-price-inflation trust model (issue #262). The
+    /// oracle feeds `totalAssets/totalSupply` straight into a lending-market
+    /// price, so an inflatable `totalAssets` would let a borrower draw against
+    /// phantom collateral. This pins the invariant the contract NatSpec relies
+    /// on: the priced vault's `totalAssets()` is an ACCOUNTED quantity, NOT raw
+    /// `balanceOf`, so a direct token/ETH donation to the vault cannot move it.
+    /// Sending value to the vault address here leaves `totalAssets()` — and
+    /// hence the reported share price — unchanged; only an accounted mint (the
+    /// `setTotalAssets` setter, standing in for a real NAV update) does. An
+    /// ERC-4626 whose `totalAssets` tracked `balanceOf` would fail this test,
+    /// documenting that such a vault is outside the trust model.
+    function testVaultTotalAssetsSourceIsAccounted() external {
+        DIAVaultOracle oracle = _deployProxy(_defaultConfig());
+        diaOracle.setValue(SYMBOL, 100e18, uint128(block.timestamp));
+        // Accounted state: 1 asset per share → price 100e8.
+        vault.setTotalAssets(1e18);
+        vault.setTotalSupply(1e18);
+        int256 before = oracle.latestAnswer();
+        assertEq(before, int256(100e8), "baseline accounted price");
+
+        // Simulate a hostile donation: force ETH onto the vault address and
+        // grow its raw balance. `totalAssets()` here is an accounted setter,
+        // NOT `balanceOf`, so it does not move — a `balanceOf`-derived vault
+        // would jump and inflate the price. The reported price is unchanged.
+        vm.deal(address(vault), 1_000_000 ether);
+
+        int256 afterDonation = oracle.latestAnswer();
+        assertEq(afterDonation, before, "a donation must not inflate an accounted-totalAssets share price");
     }
 
     // -------- latestAnswer DIA not set --------
@@ -378,6 +425,24 @@ contract DIAVaultOracleTest is Test {
 
         vm.expectRevert(abi.encodeWithSelector(DIAPriceStale.selector, uint256(staleTimestamp)));
         oracle.latestAnswer();
+    }
+
+    /// @notice A DIA push timestamped in the FUTURE (feed running ahead, or a
+    /// chain-time regression / reorg) must NOT underflow-panic in the staleness
+    /// subtraction. A future timestamp is fresh by construction (age 0), so the
+    /// read resolves to the priced value, never a bare `Panic(0x11)`. Guards
+    /// the `uint256(timestamp) <= block.timestamp` short-circuit in
+    /// `_readDIAChecked`; a regression dropping that guard would revert here
+    /// with an arithmetic panic instead of returning `100e8`.
+    function testLatestAnswerFutureTimestampNotStale() external {
+        DIAVaultOracle oracle = _deployProxy(_defaultConfig());
+        // Timestamp 100s in the future relative to `now`.
+        diaOracle.setValue(SYMBOL, 100e18, uint128(block.timestamp + 100));
+        vault.setTotalAssets(1e18);
+        vault.setTotalSupply(1e18);
+
+        int256 answer = oracle.latestAnswer();
+        assertEq(answer, int256(100e8), "future-timestamped push is fresh, not stale");
     }
 
     /// @notice The staleness edge fails closed: a push aged EXACTLY `maxAge`

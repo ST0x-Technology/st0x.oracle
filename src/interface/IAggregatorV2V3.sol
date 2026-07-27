@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: LicenseRef-DCL-1.0
 // SPDX-FileCopyrightText: Copyright (c) 2020 Rain Open Source Software Ltd
-pragma solidity =0.8.25;
+pragma solidity ^0.8.25;
 
 /// @title AggregatorV2V3Interface
 /// @notice Hybrid of Chainlink's `AggregatorInterface` (v2 — `latestAnswer`)
@@ -16,7 +16,11 @@ interface AggregatorV2V3Interface {
     /// @notice Number of decimals the answer is scaled to.
     function decimals() external view returns (uint8);
 
-    /// @notice Human-readable description of the feed (e.g. "AAPL / USD").
+    /// @notice Human-readable description of the feed. Chainlink feeds
+    /// conventionally use a pair string (e.g. `"AAPL / USD"`), but the exact
+    /// format is implementation-defined — a DIA-backed implementation may
+    /// return the bare feed symbol (e.g. `"COIN"`) instead. Consumers should
+    /// treat it as an opaque label, not parse it for the quote asset.
     function description() external view returns (string memory);
 
     /// @notice Aggregator version. Chainlink convention is `1` for v1 and

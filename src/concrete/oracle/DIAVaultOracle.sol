@@ -141,6 +141,16 @@ struct DIAVaultOracleConfig {
 /// space throughout so neither operand can overflow uint256; the conversion to
 /// fixed-point 8dp happens only at the final return.
 ///
+/// Vault trust model (donation / share-price inflation): the priced `vault`
+/// MUST be an ST0x-controlled `wtStock` whose `totalAssets()` is an ACCOUNTED
+/// quantity (an internal ledger moved only by mint/burn and NAV rebalances),
+/// not raw `balanceOf`. That is what makes reading `totalAssets/totalSupply`
+/// straight into a lending-market oracle safe: a direct token donation cannot
+/// bump `totalAssets()`, so the classic ERC-4626 inflation attack is
+/// out-of-reach. Pointing this oracle at an arbitrary ERC-4626 whose
+/// `totalAssets` tracks a caller-controllable balance is OUTSIDE the trust
+/// model and unsupported. See `_vaultSharePrice` for the per-function note.
+///
 /// Auto-pause: on every read the oracle consults `ICorporateActionsV1` on the
 /// corporate-actions vault — derived as the priced vault's `asset()`, i.e. the
 /// tStock the wtStock wraps — via `LibCorporateActionsPause`, and reverts
@@ -334,6 +344,12 @@ contract DIAVaultOracle is AggregatorV2V3Interface, ICloneableV2, Initializable 
     }
 
     /// @inheritdoc AggregatorV2V3Interface
+    /// @dev Deliberate deviation from the Chainlink-style pair-string
+    /// convention: this returns the BARE DIA feed symbol (e.g. `"COIN"`), NOT
+    /// a `"SYMBOL / USD"` pair string, because DIA keys its feeds by the bare
+    /// symbol and that is the single source of truth here. Integrators that
+    /// expect a Chainlink-formatted pair string must adjust. The interface
+    /// NatSpec is worded so it does not contradict this.
     function description() external view override returns (string memory) {
         return _main().symbol;
     }
@@ -407,20 +423,43 @@ contract DIAVaultOracle is AggregatorV2V3Interface, ICloneableV2, Initializable 
         // Comparing block.timestamp against the DIA push timestamp is the whole
         // point of the staleness check; sub-maxAge miner drift is immaterial
         // against a maxAge measured in hours. This is not a false-positive
-        // dependence on block.timestamp for value/authorisation. The edge
-        // instant fails closed (`>=`): a push exactly `maxAge` old is STALE.
-        // This is deliberate — it is what makes the cross-epoch invariant
+        // dependence on block.timestamp for value/authorisation.
+        //
+        // A push timestamped at or before `now` applies the `maxAge` window. A
+        // push timestamped in the FUTURE (a feed running slightly ahead, or a
+        // chain-time regression / reorg) is treated as fresh (age 0), never
+        // stale: the `<= block.timestamp` guard short-circuits the subtraction
+        // so it can never underflow into a bare `Panic(0x11)` that integrators
+        // cannot disambiguate from `DIAPriceStale` / `DIAPriceNotSet`.
+        //
+        // The staleness edge fails closed (`>=`): a push exactly `maxAge` old is
+        // STALE. This is deliberate — it makes the cross-epoch invariant
         // (`pauseTimeAfter >= maxAge`, see the contract NatSpec) airtight at the
-        // exact-equality boundary, and it matches the fail-closed staleness
+        // exact-equality boundary, and matches the fail-closed staleness
         // convention (the edge counts as stale).
         // slither-disable-next-line timestamp
-        if (block.timestamp - uint256(timestamp) >= $.maxAge) revert DIAPriceStale(uint256(timestamp));
+        if (uint256(timestamp) <= block.timestamp && block.timestamp - uint256(timestamp) >= $.maxAge) {
+            revert DIAPriceStale(uint256(timestamp));
+        }
     }
 
     /// @dev Compute vault share price from a DIA reading via Rain float math
     /// so neither operand can overflow uint256. DIA prices are 18-decimal
     /// `uint128`. The vault ratio is `totalAssets / totalSupply`. Output is
     /// 8-decimal `int256` per Chainlink `latestAnswer` convention.
+    ///
+    /// Donation / share-inflation trust model: this reads `totalAssets()`
+    /// directly and feeds the resulting share price to lending markets, where
+    /// an inflatable ratio would let a borrower draw against phantom
+    /// collateral. That is safe ONLY because `vault` MUST be an ST0x-controlled
+    /// `wtStock` whose `totalAssets()` derives from ACCOUNTED holdings — an
+    /// internal ledger updated only by minting/burning and by NAV rebalances —
+    /// NOT from raw `IERC20(asset).balanceOf(vault)`. A direct token donation
+    /// to the vault therefore does NOT move `totalAssets()` and cannot inflate
+    /// the ratio within a block. Arbitrary ERC-4626 vaults whose `totalAssets`
+    /// reflects a caller-controllable balance are OUT of the trust model: this
+    /// oracle must never be pointed at one. The invariant is pinned by
+    /// `testVaultTotalAssetsSourceIsAccounted`.
     function _vaultSharePrice(uint128 diaPrice) internal view returns (int256) {
         // DIA's value is 18-decimal uint128 — pack as a float with decimal
         // count 18 to recover the natural quantity.
