@@ -104,7 +104,18 @@ contract MorphoPairAdapter is Initializable, IOracle {
     /// @dev Reads both tokens' `decimals()` and precomputes the Morpho scale
     /// factors. A token whose `decimals()` is absurdly large makes the
     /// `10 ** ...` overflow and reverts here — fail-closed at init rather than
-    /// minting an always-reverting adapter.
+    /// minting an always-reverting adapter. The exact fail-closed boundaries
+    /// are `quoteDecimals >= 42` (numerator `10^(36 + quoteDecimals)` exceeds
+    /// `2^256`) and `baseDecimals >= 60` (denominator `10^(baseDecimals + 18)`
+    /// exceeds `2^256`); both surface as an arithmetic-overflow panic.
+    /// @dev Surviving init does NOT guarantee `price()` can never overflow.
+    /// A quote token with e.g. 41 decimals passes here (`10^77 < 2^256`) but
+    /// leaves `scaleNumerator ~= 1e77`, and `price()`'s
+    /// `mulDiv(central, scaleNumerator, scaleDenominator)` can then exceed
+    /// `2^256` for a normal central value when `scaleDenominator` is small —
+    /// bricking that market (fail-closed revert, never a wrong price). This is
+    /// only reachable with pathological 40+ decimal tokens; operators MUST bind
+    /// only real, sane-decimal (`<= ~18`) tokens.
     function initialize(address base, address quote) external initializer {
         if (base == address(0) || quote == address(0)) revert ZeroToken();
         if (base == quote) revert IdenticalTokens();
@@ -139,6 +150,11 @@ contract MorphoPairAdapter is Initializable, IOracle {
     /// @dev Reads the publisher-signed 18-decimal value from the central store
     /// (which enforces staleness / unset reverts) and rescales it into Morpho
     /// Blue's `1e36 * 10^loanDec / 10^collDec` convention.
+    /// @dev `Math.mulDiv` floors (rounds DOWN). This is deliberate and MUST NOT
+    /// change: the result is the Morpho *collateral* price, and under-stating
+    /// collateral is the conservative direction (less borrowing power, earlier
+    /// liquidation) that favours the lender/protocol. A `Ceil` variant would
+    /// silently reverse this safety property.
     function price() external view returns (uint256) {
         MainStorage storage $ = _main();
         return Math.mulDiv(iCentral.price($.pairId), $.scaleNumerator, $.scaleDenominator);
