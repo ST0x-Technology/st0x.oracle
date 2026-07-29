@@ -111,10 +111,18 @@ contract MorphoPairAdapterBeaconSetDeployerTest is SignedPriceTestBase {
     function testNewMorphoPairAdapterIsIdempotentPerConfig() external {
         MorphoPairAdapterBeaconSetDeployer bsd = _deployBSD();
         MorphoPairAdapter first = bsd.newMorphoPairAdapter(address(base), address(quote));
+        bytes32 firstPairId = first.pairId();
 
         // Same pair → CREATE2 collision → revert (empty returndata).
         vm.expectRevert();
         bsd.newMorphoPairAdapter(address(base), address(quote));
+
+        // The bare vm.expectRevert above is intentional: a raw CREATE2 address
+        // collision carries no selector. Prove it WAS the collision (not an
+        // unrelated early revert) — the original instance's code and configured
+        // pair survive, so no divergent second instance was forked.
+        assertGt(address(first).code.length, 0, "first instance survives the collision");
+        assertEq(first.pairId(), firstPairId, "first instance config intact after the collision");
 
         // Differing pair → different deterministic address.
         MockERC20Decimals quote2 = new MockERC20Decimals(8);

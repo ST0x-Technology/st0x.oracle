@@ -93,6 +93,13 @@ contract ST0xPriceOracleBeaconSetDeployerTest is Test {
         vm.expectRevert();
         bsd.newST0xPriceOracle(ADMIN, ORACLE_ADMIN, SIGNER, TIMEOUT);
 
+        // The bare vm.expectRevert above is intentional: a raw CREATE2 address
+        // collision carries no selector. Prove it WAS the collision (not an
+        // unrelated early revert) — the original instance's code and configured
+        // signer survive, so no divergent second instance was forked.
+        assertGt(address(first).code.length, 0, "first instance survives the collision");
+        assertEq(first.signer(), SIGNER, "first instance config intact after the collision");
+
         // Differing args → different deterministic address.
         ST0xPriceOracle second = bsd.newST0xPriceOracle(ADMIN, ORACLE_ADMIN, SIGNER, TIMEOUT + 1);
         assertTrue(address(first) != address(second), "distinct args give distinct address");

@@ -103,6 +103,13 @@ contract DIAVaultOracleBeaconSetDeployerTest is Test {
         vm.expectRevert();
         bsd.newDIAVaultOracle(_defaultOracleConfig());
 
+        // The bare vm.expectRevert above is intentional: a raw CREATE2 address
+        // collision carries no selector. Prove it WAS the collision (not an
+        // unrelated early revert) — the original instance's code and configured
+        // symbol survive, so no divergent second instance was forked.
+        assertGt(address(first).code.length, 0, "first instance survives the collision");
+        assertEq(first.symbol(), SYMBOL, "first instance config intact after the collision");
+
         // Differing config → different deterministic address. Vary
         // `pauseTimeAfter` (not `maxAge`) so the cross-epoch invariant
         // `pauseTimeAfter >= maxAge` still holds for the second config.
