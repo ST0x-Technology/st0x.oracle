@@ -2,8 +2,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2020 Rain Open Source Software Ltd
 pragma solidity =0.8.25;
 
-import {Test} from "forge-std-1.16.1/src/Test.sol";
 import {Vm} from "forge-std-1.16.1/src/Vm.sol";
+import {SignedPriceTestBase} from "../../lib/SignedPriceTestBase.sol";
 import {UpgradeableBeacon} from "@openzeppelin-contracts-5.6.1/proxy/beacon/UpgradeableBeacon.sol";
 import {BeaconProxy} from "@openzeppelin-contracts-5.6.1/proxy/beacon/BeaconProxy.sol";
 import {ST0xPriceOracle} from "../../../../src/concrete/oracle/ST0xPriceOracle.sol";
@@ -16,7 +16,7 @@ import {
 import {MorphoPairAdapterV2} from "../../../mocks/MorphoPairAdapterV2.sol";
 import {MockERC20Decimals} from "../../../mocks/MockERC20Decimals.sol";
 
-contract MorphoPairAdapterBeaconSetDeployerTest is Test {
+contract MorphoPairAdapterBeaconSetDeployerTest is SignedPriceTestBase {
     uint256 internal constant SIGNER_PK = uint256(keccak256("st0x.price-oracle.signer.test"));
     address internal SIGNER;
 
@@ -192,17 +192,7 @@ contract MorphoPairAdapterBeaconSetDeployerTest is Test {
 
     // -------- Helpers --------
 
-    function _digest(bytes32 id, uint256 price, uint256 timestamp) internal view returns (bytes32) {
-        bytes32 structHash = keccak256(abi.encode(central.PRICE_UPDATE_TYPEHASH(), id, price, timestamp));
-        return keccak256(abi.encodePacked("\x19\x01", central.domainSeparator(), structHash));
-    }
-
-    function _sign(bytes32 id, uint256 price, uint256 timestamp) internal view returns (bytes memory) {
-        (uint8 v, bytes32 r, bytes32 s) = vm.sign(SIGNER_PK, _digest(id, price, timestamp));
-        return abi.encodePacked(r, s, v);
-    }
-
     function _push(bytes32 id, uint256 price, uint256 timestamp) internal {
-        assertTrue(central.updatePrice(id, price, timestamp, _sign(id, price, timestamp)));
+        assertTrue(central.updatePrice(id, price, timestamp, signPriceUpdate(central, SIGNER_PK, id, price, timestamp)));
     }
 }
