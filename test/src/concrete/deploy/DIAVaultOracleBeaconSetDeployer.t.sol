@@ -84,7 +84,7 @@ contract DIAVaultOracleBeaconSetDeployerTest is Test {
 
     function testConstructorHappyPathDeploysBeacon() external {
         DIAVaultOracleBeaconSetDeployer bsd = _deployBSD();
-        address beacon = address(bsd.I_DIA_VAULT_ORACLE_BEACON());
+        address beacon = address(bsd.iDIAVaultOracleBeacon());
         assertTrue(beacon != address(0));
         assertEq(UpgradeableBeacon(beacon).owner(), BEACON_OWNER);
         assertEq(UpgradeableBeacon(beacon).implementation(), address(implementation));
@@ -178,7 +178,7 @@ contract DIAVaultOracleBeaconSetDeployerTest is Test {
         DIAVaultOracle b = bsd.newDIAVaultOracle(configB);
         assertTrue(address(a) != address(b), "proxies must be distinct");
 
-        address beacon = address(bsd.I_DIA_VAULT_ORACLE_BEACON());
+        address beacon = address(bsd.iDIAVaultOracleBeacon());
         assertEq(UpgradeableBeacon(beacon).implementation(), address(implementation));
 
         // V1 has no `implVersion()` — both proxies revert on it pre-upgrade.

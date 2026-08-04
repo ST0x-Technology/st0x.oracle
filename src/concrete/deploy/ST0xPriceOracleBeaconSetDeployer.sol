@@ -46,7 +46,7 @@ contract ST0xPriceOracleBeaconSetDeployer {
     event Deployment(address indexed caller, address indexed oracle);
 
     /// The beacon for the ST0xPriceOracle implementation contracts.
-    IBeacon public immutable I_ST0X_PRICE_ORACLE_BEACON;
+    IBeacon public immutable iST0xPriceOracleBeacon;
 
     constructor(ST0xPriceOracleBeaconSetDeployerConfig memory config) {
         if (config.initialST0xPriceOracleImplementation == address(0)) {
@@ -56,8 +56,7 @@ contract ST0xPriceOracleBeaconSetDeployer {
             revert ZeroBeaconOwner();
         }
 
-        I_ST0X_PRICE_ORACLE_BEACON =
-            new UpgradeableBeacon(config.initialST0xPriceOracleImplementation, config.initialOwner);
+        iST0xPriceOracleBeacon = new UpgradeableBeacon(config.initialST0xPriceOracleImplementation, config.initialOwner);
     }
 
     /// @notice Deploys and initializes a new ST0xPriceOracle proxy.
@@ -82,7 +81,7 @@ contract ST0xPriceOracleBeaconSetDeployer {
         oracle = ST0xPriceOracle(
             address(
                 new BeaconProxy{salt: salt}(
-                    address(I_ST0X_PRICE_ORACLE_BEACON),
+                    address(iST0xPriceOracleBeacon),
                     abi.encodeCall(ST0xPriceOracle.initialize, (admin, oracleAdmin, signer, timeout))
                 )
             )

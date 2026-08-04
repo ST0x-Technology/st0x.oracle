@@ -18,6 +18,8 @@ import {STOCK_SPLIT_V1_TYPE_HASH} from "st0x-deploy-0.1.1/src/lib/LibCorporateAc
 import {LibStockSplit} from "st0x-deploy-0.1.1/src/lib/LibStockSplit.sol";
 import {LibDecimalFloat} from "rain-math-float-0.1.1/src/lib/LibDecimalFloat.sol";
 import {IAuthorizeV1} from "rain-vats-0.1.5/src/interface/IAuthorizeV1.sol";
+import {LibProdTokensBase} from "st0x-deploy-0.1.1/src/lib/LibProdTokensBase.sol";
+import {DIA_FEED_BASE} from "../../../src/lib/LibDIAFeed.sol";
 
 /// @dev The `authorizer()` getter of the live receipt vault — enough surface to
 /// mock its permission gate without pulling the whole vault interface.
@@ -39,10 +41,13 @@ interface IAuthorizable {
 /// `createSelectFork` failure would red every per-push run. Locally, export
 /// `BASE_RPC_URL=https://mainnet.base.org` to run it.
 contract DIAVaultOracleForkBaseTest is Test {
-    // Live Base deployments (see st0x.deploy LibProdTokensBase).
-    address constant DIA_FEED = 0xCE521b52513242c5094bc56f57887BB2A05B8129;
-    address constant WTCOIN = 0x5cDa0E1CA4ce2af96315f7F8963C85399c172204; // StoxWrappedTokenVault (priced)
-    address constant TCOIN = 0x626757e6F50675D17fcAd312E82f989aE7A23d38; // receipt vault, ICorporateActionsV1
+    // Live Base deployments. Token vaults are imported from the pinned
+    // st0x-deploy `LibProdTokensBase` so an st0x-deploy version bump that
+    // redeploys the COIN pair propagates here automatically instead of leaving
+    // stale literals; DIA_FEED comes from the single repo-level constant.
+    address constant DIA_FEED = DIA_FEED_BASE;
+    address constant WTCOIN = LibProdTokensBase.COIN_WRAPPED_TOKEN_VAULT; // StoxWrappedTokenVault (priced)
+    address constant TCOIN = LibProdTokensBase.COIN_RECEIPT_VAULT; // receipt vault, ICorporateActionsV1
 
     uint64 constant PAUSE_BEFORE = 1 hours;
     // Satisfies the cross-epoch invariant `pauseTimeAfter >= maxAge`. The DIA
@@ -105,7 +110,14 @@ contract DIAVaultOracleForkBaseTest is Test {
     function testForkOracleAutoPausesOnRealScheduledSplit() external {
         string memory rpc = vm.envOr("BASE_RPC_URL", string(""));
         if (bytes(rpc).length == 0) {
-            console2.log("SKIP testForkOracleAutoPausesOnRealScheduledSplit: BASE_RPC_URL unset");
+            // The dedicated fork job sets FORK_TESTS=1 (see fork-tests.yaml).
+            // There a missing RPC is a misconfiguration (e.g. a lapsed repo
+            // secret) and MUST fail loudly rather than silently no-op —
+            // otherwise the only real-vault auto-pause proof would pass having
+            // verified nothing. On the per-push rainix job FORK_TESTS is unset,
+            // so this is an unambiguous non-run (no assertions were made).
+            require(vm.envOr("FORK_TESTS", uint256(0)) == 0, "BASE_RPC_URL unset in fork job");
+            console2.log("SKIP testForkOracleAutoPausesOnRealScheduledSplit: BASE_RPC_URL unset (per-push job)");
             return;
         }
         vm.createSelectFork(rpc);

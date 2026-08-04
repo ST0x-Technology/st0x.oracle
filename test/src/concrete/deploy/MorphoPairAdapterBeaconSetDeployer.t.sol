@@ -76,10 +76,10 @@ contract MorphoPairAdapterBeaconSetDeployerTest is Test {
 
     function testConstructorHappyPathDeploysBeacon() external {
         MorphoPairAdapterBeaconSetDeployer bsd = _deployBSD();
-        address beacon = address(bsd.I_MORPHO_PAIR_ADAPTER_BEACON());
+        address beacon = address(bsd.iMorphoPairAdapterBeacon());
         assertTrue(beacon != address(0));
         assertEq(UpgradeableBeacon(beacon).owner(), BEACON_OWNER);
-        assertEq(address(bsd.I_CENTRAL()), address(central), "central immutable wired");
+        assertEq(address(bsd.iCentral()), address(central), "central immutable wired");
 
         // The beacon's implementation is bound to the same central store.
         MorphoPairAdapter impl = MorphoPairAdapter(UpgradeableBeacon(beacon).implementation());
@@ -167,7 +167,7 @@ contract MorphoPairAdapterBeaconSetDeployerTest is Test {
         bytes32 pairA = central.pairId(address(base), address(quote));
         bytes32 pairB = central.pairId(address(base2), address(quote));
 
-        address beacon = address(bsd.I_MORPHO_PAIR_ADAPTER_BEACON());
+        address beacon = address(bsd.iMorphoPairAdapterBeacon());
 
         // V1 has no `version()` — both proxies revert on it pre-upgrade.
         (bool okA,) = address(a).staticcall(abi.encodeWithSignature("version()"));

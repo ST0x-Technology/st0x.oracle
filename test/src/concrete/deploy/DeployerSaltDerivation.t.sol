@@ -74,7 +74,7 @@ contract DeployerSaltDerivationTest is Test {
         address predicted = _predict(
             address(bsd),
             expectedSalt,
-            address(bsd.I_MORPHO_PAIR_ADAPTER_BEACON()),
+            address(bsd.iMorphoPairAdapterBeacon()),
             abi.encodeCall(MorphoPairAdapter.initialize, (address(base), address(quote)))
         );
 
@@ -97,7 +97,7 @@ contract DeployerSaltDerivationTest is Test {
         address predicted = _predict(
             address(bsd),
             expectedSalt,
-            address(bsd.I_ST0X_PRICE_ORACLE_BEACON()),
+            address(bsd.iST0xPriceOracleBeacon()),
             abi.encodeCall(ST0xPriceOracle.initialize, (ADMIN, ORACLE_ADMIN, SIGNER, TIMEOUT))
         );
 

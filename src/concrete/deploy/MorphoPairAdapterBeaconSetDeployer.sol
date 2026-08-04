@@ -46,11 +46,11 @@ contract MorphoPairAdapterBeaconSetDeployer {
     event Deployment(address indexed caller, address indexed oracle);
 
     /// The beacon for the MorphoPairAdapter implementation contracts.
-    IBeacon public immutable I_MORPHO_PAIR_ADAPTER_BEACON;
+    IBeacon public immutable iMorphoPairAdapterBeacon;
 
     /// The central multi-pair price store every adapter deployed through this
     /// beacon reads — fixed for the beacon's whole life.
-    ST0xPriceOracle public immutable I_CENTRAL;
+    ST0xPriceOracle public immutable iCentral;
 
     constructor(MorphoPairAdapterBeaconSetDeployerConfig memory config) {
         if (config.initialOwner == address(0)) {
@@ -61,8 +61,8 @@ contract MorphoPairAdapterBeaconSetDeployer {
         // implementation constructor — no local guard needed.
         MorphoPairAdapter implementation = new MorphoPairAdapter(config.central);
 
-        I_CENTRAL = config.central;
-        I_MORPHO_PAIR_ADAPTER_BEACON = new UpgradeableBeacon(address(implementation), config.initialOwner);
+        iCentral = config.central;
+        iMorphoPairAdapterBeacon = new UpgradeableBeacon(address(implementation), config.initialOwner);
     }
 
     /// @notice Deploys and initializes a new MorphoPairAdapter proxy.
@@ -82,7 +82,7 @@ contract MorphoPairAdapterBeaconSetDeployer {
         oracle = MorphoPairAdapter(
             address(
                 new BeaconProxy{salt: salt}(
-                    address(I_MORPHO_PAIR_ADAPTER_BEACON), abi.encodeCall(MorphoPairAdapter.initialize, (base, quote))
+                    address(iMorphoPairAdapterBeacon), abi.encodeCall(MorphoPairAdapter.initialize, (base, quote))
                 )
             )
         );

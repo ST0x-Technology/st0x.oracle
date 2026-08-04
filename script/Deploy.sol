@@ -67,7 +67,7 @@ contract Deploy is Script {
         // every oracle proxy, i.e. every served price — must be owned by the
         // requested owner, never left with the (hot, CI-held) deploy key.
         require(
-            Ownable(address(oracleBSD.I_DIA_VAULT_ORACLE_BEACON())).owner() == beaconInitialOwner,
+            Ownable(address(oracleBSD.iDIAVaultOracleBeacon())).owner() == beaconInitialOwner,
             "oracle beacon owner mismatch"
         );
 
@@ -86,7 +86,17 @@ contract Deploy is Script {
     /// env: `ST0X_ADMIN`, `ST0X_ORACLE_ADMIN`, `ST0X_SIGNER` (addresses) and
     /// `ST0X_TIMEOUT` (uint64).
     /// @param beaconInitialOwner Initial owner of both beacons.
-    function deploySignedPriceStack(address beaconInitialOwner, address deployer) internal {
+    /// @return central The singleton central `ST0xPriceOracle` store.
+    /// @return oracleBSD The deployed `ST0xPriceOracleBeaconSetDeployer`.
+    /// @return adapterBSD The deployed `MorphoPairAdapterBeaconSetDeployer`.
+    function deploySignedPriceStack(address beaconInitialOwner, address deployer)
+        internal
+        returns (
+            ST0xPriceOracle central,
+            ST0xPriceOracleBeaconSetDeployer oracleBSD,
+            MorphoPairAdapterBeaconSetDeployer adapterBSD
+        )
+    {
         address admin = vm.envAddress("ST0X_ADMIN");
         address oracleAdmin = vm.envAddress("ST0X_ORACLE_ADMIN");
         address signer = vm.envAddress("ST0X_SIGNER");
@@ -105,7 +115,7 @@ contract Deploy is Script {
         require(oracleAdmin != deployer, "ST0X_ORACLE_ADMIN must not be the deploy key");
 
         ST0xPriceOracle oracleImpl = new ST0xPriceOracle();
-        ST0xPriceOracleBeaconSetDeployer oracleBSD = new ST0xPriceOracleBeaconSetDeployer(
+        oracleBSD = new ST0xPriceOracleBeaconSetDeployer(
             ST0xPriceOracleBeaconSetDeployerConfig({
                 initialOwner: beaconInitialOwner, initialST0xPriceOracleImplementation: address(oracleImpl)
             })
@@ -113,9 +123,9 @@ contract Deploy is Script {
 
         // The singleton central store, minted through its own beacon-set
         // deployer so its creation is atomic and recorded (Deployment event).
-        ST0xPriceOracle central = oracleBSD.newST0xPriceOracle(admin, oracleAdmin, signer, timeout);
+        central = oracleBSD.newST0xPriceOracle(admin, oracleAdmin, signer, timeout);
 
-        MorphoPairAdapterBeaconSetDeployer adapterBSD = new MorphoPairAdapterBeaconSetDeployer(
+        adapterBSD = new MorphoPairAdapterBeaconSetDeployer(
             MorphoPairAdapterBeaconSetDeployerConfig({initialOwner: beaconInitialOwner, central: central})
         );
 
@@ -130,11 +140,11 @@ contract Deploy is Script {
         // every proxy, i.e. every served price — must be owned by the requested
         // owner, never left with the (hot, CI-held) deploy key.
         require(
-            Ownable(address(oracleBSD.I_ST0X_PRICE_ORACLE_BEACON())).owner() == beaconInitialOwner,
+            Ownable(address(oracleBSD.iST0xPriceOracleBeacon())).owner() == beaconInitialOwner,
             "oracle beacon owner mismatch"
         );
         require(
-            Ownable(address(adapterBSD.I_MORPHO_PAIR_ADAPTER_BEACON())).owner() == beaconInitialOwner,
+            Ownable(address(adapterBSD.iMorphoPairAdapterBeacon())).owner() == beaconInitialOwner,
             "adapter beacon owner mismatch"
         );
 

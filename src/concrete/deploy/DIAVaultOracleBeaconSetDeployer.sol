@@ -46,7 +46,7 @@ contract DIAVaultOracleBeaconSetDeployer {
     event Deployment(address indexed caller, address indexed oracle);
 
     /// The beacon for the DIAVaultOracle implementation contracts.
-    IBeacon public immutable I_DIA_VAULT_ORACLE_BEACON;
+    IBeacon public immutable iDIAVaultOracleBeacon;
 
     constructor(DIAVaultOracleBeaconSetDeployerConfig memory config) {
         if (config.initialDIAVaultOracleImplementation == address(0)) {
@@ -56,8 +56,7 @@ contract DIAVaultOracleBeaconSetDeployer {
             revert ZeroBeaconOwner();
         }
 
-        I_DIA_VAULT_ORACLE_BEACON =
-            new UpgradeableBeacon(config.initialDIAVaultOracleImplementation, config.initialOwner);
+        iDIAVaultOracleBeacon = new UpgradeableBeacon(config.initialDIAVaultOracleImplementation, config.initialOwner);
     }
 
     /// @notice Deploys and initializes a new DIAVaultOracle proxy.
@@ -70,7 +69,7 @@ contract DIAVaultOracleBeaconSetDeployer {
     // slither-disable-next-line reentrancy-events
     function newDIAVaultOracle(DIAVaultOracleConfig memory config) external returns (DIAVaultOracle oracle) {
         bytes32 salt = keccak256(abi.encode(config));
-        oracle = DIAVaultOracle(address(new BeaconProxy{salt: salt}(address(I_DIA_VAULT_ORACLE_BEACON), "")));
+        oracle = DIAVaultOracle(address(new BeaconProxy{salt: salt}(address(iDIAVaultOracleBeacon), "")));
 
         if (oracle.initialize(abi.encode(config)) != ICLONEABLE_V2_SUCCESS) {
             revert InitializeOracleFailed();

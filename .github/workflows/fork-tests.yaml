@@ -30,9 +30,56 @@ jobs:
       - name: Run fork tests against live Base
         env:
           BASE_RPC_URL: ${{ secrets.RPC_URL_BASE_FORK || vars.RPC_URL_BASE_FORK }}
+          # Marks this as the authoritative fork job: a missing RPC here (e.g. a
+          # lapsed secret) makes the fork test require() fail loudly instead of
+          # silently no-opping, so the real-vault auto-pause proof can't pass
+          # having verified nothing.
+          FORK_TESTS: '1'
         run: |
           if [ -z "${BASE_RPC_URL}" ]; then
             echo "::error::BASE_RPC_URL is empty — set the RPC_URL_BASE_FORK repo secret/var so fork tests run." >&2
             exit 1
           fi
           nix develop -c forge test --match-path "test/src/fork/*" -vvv
+  # Fence for #214: the operator-facing deploy-suite dropdown in
+  # manual-sol-artifacts.yaml and the keccak256("...") dispatch preimages in
+  # script/Deploy.sol are two hand-maintained copies of the same suite names.
+  # A typo, reorder, or added/removed suite on either side otherwise only
+  # surfaces as a confusing "Unknown deployment suite" revert at deploy time
+  # (or, worse, silently routes to the wrong handler). This offline guard
+  # asserts the two sets are EXACTLY equal, failing CI on any drift. No forge /
+  # nix needed — pure grep, so it runs fast on every push.
+  suite-name-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Assert deploy-suite dropdown matches Deploy.sol constants
+        run: |
+          set -euo pipefail
+          workflow=.github/workflows/manual-sol-artifacts.yaml
+          deploy=script/Deploy.sol
+
+          # Dropdown options: the `- value` lines in the `suite:` input's
+          # `options:` block (10-space indent for the list items).
+          dropdown=$(awk '
+            /^      suite:/            { in_suite=1; next }
+            in_suite && /^        options:/ { in_opts=1; next }
+            in_opts && /^          - /  { sub(/^          - /, ""); print; next }
+            in_opts && !/^          - / { in_opts=0; in_suite=0 }
+          ' "$workflow" | sort)
+
+          # keccak256("...") preimages used as DEPLOYMENT_SUITE_* dispatch keys.
+          constants=$(grep -oE 'keccak256\("[^"]+"\)' "$deploy" \
+            | sed -E 's/keccak256\("([^"]+)"\)/\1/' | sort -u)
+
+          echo "Dropdown suites:"; echo "$dropdown" | sed 's/^/  - /'
+          echo "Deploy.sol suites:"; echo "$constants" | sed 's/^/  - /'
+
+          if [ "$dropdown" != "$constants" ]; then
+            echo "::error::Deploy-suite names drift between $workflow and $deploy." >&2
+            diff <(echo "$dropdown") <(echo "$constants") || true
+            exit 1
+          fi
+          echo "Deploy-suite names are in sync."

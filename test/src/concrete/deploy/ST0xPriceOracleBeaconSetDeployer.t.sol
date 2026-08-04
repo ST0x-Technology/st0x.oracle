@@ -62,7 +62,7 @@ contract ST0xPriceOracleBeaconSetDeployerTest is Test {
 
     function testConstructorHappyPathDeploysBeacon() external {
         ST0xPriceOracleBeaconSetDeployer bsd = _deployBSD();
-        address beacon = address(bsd.I_ST0X_PRICE_ORACLE_BEACON());
+        address beacon = address(bsd.iST0xPriceOracleBeacon());
         assertTrue(beacon != address(0));
         assertEq(UpgradeableBeacon(beacon).owner(), BEACON_OWNER);
         assertEq(UpgradeableBeacon(beacon).implementation(), address(implementation));
@@ -138,7 +138,7 @@ contract ST0xPriceOracleBeaconSetDeployerTest is Test {
         ST0xPriceOracle b = bsd.newST0xPriceOracle(ADMIN, ORACLE_ADMIN, SIGNER, TIMEOUT + 1);
         assertTrue(address(a) != address(b), "proxies must be distinct");
 
-        address beacon = address(bsd.I_ST0X_PRICE_ORACLE_BEACON());
+        address beacon = address(bsd.iST0xPriceOracleBeacon());
         assertEq(UpgradeableBeacon(beacon).implementation(), address(implementation));
 
         // V1 has no `implVersion()` — both proxies revert on it pre-upgrade.

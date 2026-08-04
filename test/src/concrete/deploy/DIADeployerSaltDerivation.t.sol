@@ -75,7 +75,7 @@ contract DIADeployerSaltDerivationTest is Test {
         DIAVaultOracleConfig memory cfg = _config("COIN");
 
         bytes32 expectedSalt = keccak256(abi.encode(cfg));
-        address predicted = _predict(address(bsd), expectedSalt, address(bsd.I_DIA_VAULT_ORACLE_BEACON()));
+        address predicted = _predict(address(bsd), expectedSalt, address(bsd.iDIAVaultOracleBeacon()));
 
         DIAVaultOracle oracle = bsd.newDIAVaultOracle(cfg);
         assertEq(address(oracle), predicted, "DIA proxy must land at keccak256(config) CREATE2 address");
