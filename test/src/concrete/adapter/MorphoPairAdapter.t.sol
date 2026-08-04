@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2020 Rain Open Source Software Ltd
 pragma solidity =0.8.25;
 
-import {Test} from "forge-std-1.16.1/src/Test.sol";
+import {Test, stdError} from "forge-std-1.16.1/src/Test.sol";
 
 import {UpgradeableBeacon} from "@openzeppelin-contracts-5.6.1/proxy/beacon/UpgradeableBeacon.sol";
 import {BeaconProxy} from "@openzeppelin-contracts-5.6.1/proxy/beacon/BeaconProxy.sol";
@@ -111,6 +111,42 @@ contract MorphoPairAdapterTest is Test {
         _deployAdapter(address(base), address(base));
     }
 
+    /// @notice Fail-closed at init: a quote (loan) token with absurdly large
+    /// `decimals()` makes `scaleNumerator = 10 ** (36 + quoteDecimals)`
+    /// overflow uint256, reverting init with an arithmetic panic rather than
+    /// minting an always-reverting adapter. The boundary is `quoteDecimals >=
+    /// 42` (`10^78 > 2^256`); pins the NatSpec "fail-closed" safety claim.
+    function test_MorphoPairAdapter_AbsurdQuoteDecimals_RevertsAtInit() public {
+        MockERC20Decimals hugeQuote = new MockERC20Decimals(42);
+        vm.expectRevert(stdError.arithmeticError);
+        _deployAdapter(address(base), address(hugeQuote));
+    }
+
+    /// @notice Fail-closed at init on the denominator side: a base (collateral)
+    /// token with absurdly large `decimals()` makes `scaleDenominator = 10 **
+    /// (baseDecimals + 18)` overflow uint256. The boundary is `baseDecimals >=
+    /// 60` (`10^78 > 2^256`).
+    function test_MorphoPairAdapter_AbsurdBaseDecimals_RevertsAtInit() public {
+        MockERC20Decimals hugeBase = new MockERC20Decimals(60);
+        vm.expectRevert(stdError.arithmeticError);
+        _deployAdapter(address(hugeBase), address(quote));
+    }
+
+    /// @notice Rounding-direction pin (#265). When the net Morpho exponent is
+    /// negative the rescale divides, and `Math.mulDiv` MUST floor (round DOWN)
+    /// — the conservative direction for a Morpho collateral price. base=30dec
+    /// (collateral), quote=6dec (loan) ⇒ net exponent 36 + 6 - 30 - 18 = -6, so
+    /// price() = floor(central / 1e6). A non-divisible central value that would
+    /// give 1 flooring vs 2 ceiling discriminates the direction.
+    function test_MorphoPairAdapter_PriceFloorsDown() public {
+        MockERC20Decimals base30 = new MockERC20Decimals(30);
+        MorphoPairAdapter adapter = _deployAdapter(address(base30), address(quote));
+        bytes32 id = oracle.pairId(address(base30), address(quote));
+        // 1_999_999 / 1e6 = 1.999999 → floors to 1 (ceil would be 2).
+        _push(id, 1_999_999, block.timestamp);
+        assertEq(adapter.price(), 1, "mulDiv must floor (round DOWN), not ceil");
+    }
+
     function test_MorphoPairAdapter_InitializeOnlyOnce() public {
         MorphoPairAdapter adapter = _deployAdapter(address(base), address(quote));
         vm.expectRevert(Initializable.InvalidInitialization.selector);
@@ -162,6 +198,15 @@ contract MorphoPairAdapterTest is Test {
         assertEq(address(adapterA.iCentral()), address(oracle), "central immutable intact");
         _push(PAIR_A, 42e18, block.timestamp);
         assertEq(adapterA.price(), 42e24, "still rescales the central price");
+
+        // Known-answer for the only 8-dec-collateral / 6-dec-loan pair in the
+        // suite. Publisher signs the whole-token ratio 42.0 as 42e18; the
+        // adapter rescales by num/denom = 10^(36+6) / 10^(8+18), so
+        // price() = 42e18 * 10^42 / 10^26 = 42 * 10^34. Catches an exponent
+        // sign error that only shows when baseDecimals is neither 18 nor equal
+        // to quoteDecimals.
+        _push(pairB, 42e18, block.timestamp);
+        assertEq(adapterB.price(), 42 * 10 ** 34, "8-dec collateral / 6-dec loan rescale");
     }
 
     // -------- Helpers --------
