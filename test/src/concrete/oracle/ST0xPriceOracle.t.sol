@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2020 Rain Open Source Software Ltd
 pragma solidity =0.8.25;
 
-import {Test} from "forge-std-1.16.1/src/Test.sol";
+import {SignedPriceTestBase} from "../../lib/SignedPriceTestBase.sol";
 
 import {UpgradeableBeacon} from "@openzeppelin-contracts-5.6.1/proxy/beacon/UpgradeableBeacon.sol";
 import {BeaconProxy} from "@openzeppelin-contracts-5.6.1/proxy/beacon/BeaconProxy.sol";
@@ -16,7 +16,7 @@ import {ST0xPriceOracle} from "../../../../src/concrete/oracle/ST0xPriceOracle.s
 /// timeout config, the strict-timestamp no-op-vs-revert semantics of
 /// `updatePrice` (no registration, no nonce), `price()` unset/staleness
 /// reverts, and the deterministic `pairId` derivation.
-contract ST0xPriceOracleTest is Test {
+contract ST0xPriceOracleTest is SignedPriceTestBase {
     uint256 constant SIGNER_PK = uint256(keccak256("st0x.price-oracle.signer.test"));
     address SIGNER;
 
@@ -181,7 +181,9 @@ contract ST0xPriceOracleTest is Test {
     function test_UpdatePrice_FirstUpdateOnBrandNewPair_AppliesAndEmits() public {
         vm.expectEmit(true, false, false, true, address(oracle));
         emit ST0xPriceOracle.PriceUpdated(PAIR_A, 42e18, block.timestamp);
-        bool applied = oracle.updatePrice(PAIR_A, 42e18, block.timestamp, _sign(PAIR_A, 42e18, block.timestamp));
+        bool applied = oracle.updatePrice(
+            PAIR_A, 42e18, block.timestamp, signPriceUpdate(oracle, SIGNER_PK, PAIR_A, 42e18, block.timestamp)
+        );
         assertTrue(applied, "fresh update should apply");
 
         (uint256 storedPrice, uint256 storedTs) = oracle.pairPrice(PAIR_A);
@@ -225,7 +227,7 @@ contract ST0xPriceOracleTest is Test {
     /// a strictly-newer payload is malformed input — that DOES revert.
     function test_UpdatePrice_InvalidSignatureOnFreshTimestamp_Reverts() public {
         uint256 wrongPk = uint256(keccak256("wrong-signer"));
-        bytes32 digest = _digest(PAIR_A, 42e18, block.timestamp);
+        bytes32 digest = digestFor(oracle, PAIR_A, 42e18, block.timestamp);
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(wrongPk, digest);
         vm.expectRevert(abi.encodeWithSelector(ST0xPriceOracle.PriceUpdateInvalidSignature.selector, PAIR_A));
         oracle.updatePrice(PAIR_A, 42e18, block.timestamp, abi.encodePacked(r, s, v));
@@ -234,7 +236,7 @@ contract ST0xPriceOracleTest is Test {
     /// @notice `updatePrice` is permissionless — any caller with a validly
     /// signed fresh payload succeeds.
     function test_UpdatePrice_Permissionless() public {
-        bytes memory sig = _sign(PAIR_A, 42e18, block.timestamp);
+        bytes memory sig = signPriceUpdate(oracle, SIGNER_PK, PAIR_A, 42e18, block.timestamp);
         vm.prank(RANDO);
         assertTrue(oracle.updatePrice(PAIR_A, 42e18, block.timestamp, sig), "rando can push a signed price");
     }
@@ -245,7 +247,7 @@ contract ST0xPriceOracleTest is Test {
     /// different oracle deployment — one publisher signature fans out to a
     /// multi-chain deployment.
     function test_UpdatePrice_CrossChainReplay_SameSignatureAppliesOnOtherDeployment() public {
-        bytes memory sig = _sign(PAIR_A, 42e18, block.timestamp);
+        bytes memory sig = signPriceUpdate(oracle, SIGNER_PK, PAIR_A, 42e18, block.timestamp);
         assertTrue(oracle.updatePrice(PAIR_A, 42e18, block.timestamp, sig), "applies on the home chain");
 
         // A second deployment (fresh proxy → different verifyingContract)
@@ -275,7 +277,7 @@ contract ST0xPriceOracleTest is Test {
     /// an un-serveable price.
     function test_UpdatePrice_FutureTimestamp_Rejected() public {
         uint256 future = block.timestamp + 1 hours;
-        bytes memory sig = _sign(PAIR_A, 42e18, future);
+        bytes memory sig = signPriceUpdate(oracle, SIGNER_PK, PAIR_A, 42e18, future);
         vm.expectRevert(abi.encodeWithSelector(ST0xPriceOracle.PriceFuture.selector, PAIR_A));
         oracle.updatePrice(PAIR_A, 42e18, future, sig);
 
@@ -290,7 +292,9 @@ contract ST0xPriceOracleTest is Test {
     /// is the accepted region.)
     function test_UpdatePrice_CurrentTimestamp_Applies() public {
         assertTrue(
-            oracle.updatePrice(PAIR_A, 42e18, block.timestamp, _sign(PAIR_A, 42e18, block.timestamp)),
+            oracle.updatePrice(
+                PAIR_A, 42e18, block.timestamp, signPriceUpdate(oracle, SIGNER_PK, PAIR_A, 42e18, block.timestamp)
+            ),
             "now is not the future"
         );
         assertEq(oracle.price(PAIR_A), 42e18, "current-timestamp price is servable");
@@ -431,12 +435,12 @@ contract ST0xPriceOracleTest is Test {
 
         // Old key no longer authorises a fresh payload...
         vm.warp(block.timestamp + 1);
-        bytes memory oldKeySig = _sign(PAIR_A, 43e18, block.timestamp);
+        bytes memory oldKeySig = signPriceUpdate(oracle, SIGNER_PK, PAIR_A, 43e18, block.timestamp);
         vm.expectRevert(abi.encodeWithSelector(ST0xPriceOracle.PriceUpdateInvalidSignature.selector, PAIR_A));
         oracle.updatePrice(PAIR_A, 43e18, block.timestamp, oldKeySig);
 
         // ...the new key does.
-        (uint8 v, bytes32 r, bytes32 s) = vm.sign(newPk, _digest(PAIR_A, 43e18, block.timestamp));
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(newPk, digestFor(oracle, PAIR_A, 43e18, block.timestamp));
         assertTrue(oracle.updatePrice(PAIR_A, 43e18, block.timestamp, abi.encodePacked(r, s, v)), "new key applies");
 
         // Rotation preserved the previously stored state until then.
@@ -497,17 +501,7 @@ contract ST0xPriceOracleTest is Test {
 
     // -------- Helpers --------
 
-    function _digest(bytes32 id, uint256 price, uint256 timestamp) internal view returns (bytes32) {
-        bytes32 structHash = keccak256(abi.encode(oracle.PRICE_UPDATE_TYPEHASH(), id, price, timestamp));
-        return keccak256(abi.encodePacked("\x19\x01", oracle.domainSeparator(), structHash));
-    }
-
-    function _sign(bytes32 id, uint256 price, uint256 timestamp) internal view returns (bytes memory) {
-        (uint8 v, bytes32 r, bytes32 s) = vm.sign(SIGNER_PK, _digest(id, price, timestamp));
-        return abi.encodePacked(r, s, v);
-    }
-
     function _push(bytes32 id, uint256 price, uint256 timestamp) internal {
-        assertTrue(oracle.updatePrice(id, price, timestamp, _sign(id, price, timestamp)));
+        assertTrue(oracle.updatePrice(id, price, timestamp, signPriceUpdate(oracle, SIGNER_PK, id, price, timestamp)));
     }
 }
