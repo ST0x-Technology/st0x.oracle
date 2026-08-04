@@ -38,7 +38,13 @@ import {MessageHashUtils} from "@openzeppelin-contracts-5.6.1/utils/cryptography
 /// so the same signed price payload is valid on every deployment sharing
 /// the global signer. One publisher signature fans out to every chain the
 /// oracle is deployed on; that is a feature for multi-chain deployment, not
-/// an oversight.
+/// an oversight. NOTE the precondition: because `pairId` binds the base and
+/// quote token ADDRESSES (`keccak256(abi.encodePacked(baseToken,
+/// quoteToken))`), a signature only replays to deployments where the pair's
+/// token addresses are IDENTICAL (e.g. deterministic CREATE2 addresses).
+/// Pairs whose token addresses differ per chain resolve to different
+/// `pairId`s and therefore require a per-chain signature; a publisher must
+/// not assume one signature covers a pair whose addresses vary by chain.
 ///
 /// Roles:
 ///  - `DEFAULT_ADMIN_ROLE` — role administration only (granted to `admin`
@@ -107,6 +113,13 @@ contract ST0xPriceOracle is Initializable, AccessControlUpgradeable {
     error PriceUnset(bytes32 pairId);
     error PriceStale(bytes32 pairId);
     error PriceFuture(bytes32 pairId);
+    /// @dev Raised when a signed update carries a zero `price`. A zero is the
+    /// uninitialized default of the signing pipeline and, if served, values a
+    /// pair at nothing downstream (e.g. Morpho collateral priced at zero).
+    /// Rejected at the update boundary, symmetric with the other
+    /// degenerate-value guards, per the fail-closed rule.
+    /// @param pairId The pair whose update carried a zero price.
+    error PriceZero(bytes32 pairId);
     error PriceUpdateInvalidSignature(bytes32 pairId);
 
     event SignerSet(address indexed signer);
@@ -195,8 +208,11 @@ contract ST0xPriceOracle is Initializable, AccessControlUpgradeable {
     /// NO-OP, so a lost update race can never revert a surrounding call. A
     /// strictly-newer payload timestamped in the FUTURE (`> block.timestamp`)
     /// reverts `PriceFuture` — it would strand `price()` behind an arithmetic
-    /// underflow. An invalid signature on an otherwise-valid payload is
-    /// malformed input and reverts `PriceUpdateInvalidSignature`.
+    /// underflow. A strictly-newer payload carrying a zero `price` reverts
+    /// `PriceZero`. An invalid signature on a strictly-newer payload is
+    /// malformed input and reverts `PriceUpdateInvalidSignature`; the
+    /// signature is verified before the future/zero content checks, so an
+    /// unauthenticated payload always reverts the signature error.
     function updatePrice(bytes32 id, uint256 newPrice, uint256 newTimestamp, bytes calldata signature)
         external
         returns (bool applied)
@@ -208,6 +224,18 @@ contract ST0xPriceOracle is Initializable, AccessControlUpgradeable {
         // signature so stale replays are cheap and never brick a caller.
         if (newTimestamp <= stored.timestamp) {
             return false;
+        }
+
+        // Verify the publisher signature BEFORE any content validation of the
+        // payload, so an unauthenticated payload always reverts
+        // `PriceUpdateInvalidSignature` — never a content-check selector
+        // (`PriceFuture` / `PriceZero`) that would misreport an unsigned probe
+        // as an operator/clock fault to off-chain monitoring. The stale/no-op
+        // short-circuit above stays first: it is intentionally cheap and
+        // signature-free so a lost update race can never brick a caller.
+        bytes32 structHash = keccak256(abi.encode(PRICE_UPDATE_TYPEHASH, id, newPrice, newTimestamp));
+        if (ECDSA.recover(MessageHashUtils.toTypedDataHash(DOMAIN_SEPARATOR, structHash), signature) != $.signer) {
+            revert PriceUpdateInvalidSignature(id);
         }
 
         // A future timestamp is out-of-model input: `price()` computes
@@ -223,9 +251,11 @@ contract ST0xPriceOracle is Initializable, AccessControlUpgradeable {
             revert PriceFuture(id);
         }
 
-        bytes32 structHash = keccak256(abi.encode(PRICE_UPDATE_TYPEHASH, id, newPrice, newTimestamp));
-        if (ECDSA.recover(MessageHashUtils.toTypedDataHash(DOMAIN_SEPARATOR, structHash), signature) != $.signer) {
-            revert PriceUpdateInvalidSignature(id);
+        // A zero price is the uninitialized default of the signing pipeline;
+        // serving it would value the pair at nothing downstream. Reject it,
+        // symmetric with the future-timestamp guard.
+        if (newPrice == 0) {
+            revert PriceZero(id);
         }
 
         stored.price = newPrice;

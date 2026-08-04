@@ -285,6 +285,35 @@ contract ST0xPriceOracleTest is Test {
         oracle.price(PAIR_A);
     }
 
+    /// @notice A strictly-newer, validly-signed payload carrying a ZERO price
+    /// is rejected with `PriceZero`. A zero is the uninitialized default of the
+    /// signing pipeline; serving it values the pair at nothing downstream
+    /// (e.g. Morpho collateral priced at zero). Guarded symmetrically with the
+    /// other degenerate-value reverts, and the pair stays unset.
+    function test_UpdatePrice_ZeroPrice_Reverts() public {
+        bytes memory sig = _sign(PAIR_A, 0, block.timestamp);
+        vm.expectRevert(abi.encodeWithSelector(ST0xPriceOracle.PriceZero.selector, PAIR_A));
+        oracle.updatePrice(PAIR_A, 0, block.timestamp, sig);
+
+        // Nothing was stored — price() reverts the normal unset revert.
+        vm.expectRevert(abi.encodeWithSelector(ST0xPriceOracle.PriceUnset.selector, PAIR_A));
+        oracle.price(PAIR_A);
+    }
+
+    /// @notice The signature is verified BEFORE the content checks: a
+    /// future-dated payload carrying a WRONG-key signature reverts
+    /// `PriceUpdateInvalidSignature`, NOT `PriceFuture`. An unauthenticated
+    /// payload must always surface as a signature fault so off-chain
+    /// monitoring keyed on the revert selector is never misled, and an
+    /// unauthenticated party cannot probe the future-vs-accept boundary.
+    function test_UpdatePrice_WronglySignedFuturePayload_RevertsInvalidSignatureNotFuture() public {
+        uint256 wrongPk = uint256(keccak256("wrong-signer"));
+        uint256 future = block.timestamp + 1 hours;
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(wrongPk, _digest(PAIR_A, 42e18, future));
+        vm.expectRevert(abi.encodeWithSelector(ST0xPriceOracle.PriceUpdateInvalidSignature.selector, PAIR_A));
+        oracle.updatePrice(PAIR_A, 42e18, future, abi.encodePacked(r, s, v));
+    }
+
     /// @notice The boundary: a payload timestamped at EXACTLY block.timestamp
     /// is not in the future and applies. (`newTimestamp <= block.timestamp`
     /// is the accepted region.)
