@@ -15,6 +15,7 @@ path = [
   "AGENTS.md",
   "CLAUDE.md",
   "audit/**",
+  ".audit/**",
   "slither.config.json",
 ]
 SPDX-FileCopyrightText = "Copyright (c) 2020 Rain Open Source Software Ltd"

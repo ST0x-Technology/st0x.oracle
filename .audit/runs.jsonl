@@ -1,0 +1,1 @@
+{"scope": "whole-repo", "auditedAt": "2026-07-26T08:23:39Z", "auditedCommit": "31441bb47015b13ab9a8a5e004e601a51522a32e", "skillVersion": "0.12.0", "skillCommit": "6ed28ecd3fe556ead7e522117ce6d62b9da169f0", "dimensions": ["process", "security", "test-coverage", "documentation", "code-quality", "correctness", "hazard-surface"], "fileCount": 43}
