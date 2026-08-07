@@ -5,7 +5,7 @@ pragma solidity =0.8.25;
 import {IDIAOracleV2} from "../../interface/IDIAOracleV2.sol";
 import {AggregatorV2V3Interface} from "../../interface/IAggregatorV2V3.sol";
 import {LibCorporateActionsPause} from "../../lib/LibCorporateActionsPause.sol";
-import {ACTION_TYPE_INIT_V1} from "st0x-deploy-0.1.1/src/interface/ICorporateActionsV1.sol";
+import {ICorporateActionsV1, ACTION_TYPE_INIT_V1} from "st0x-deploy-0.1.1/src/interface/ICorporateActionsV1.sol";
 import {LibDecimalFloat, Float} from "rain-math-float-0.1.1/src/lib/LibDecimalFloat.sol";
 import {IERC4626} from "@openzeppelin-contracts-5.6.1/interfaces/IERC4626.sol";
 import {ICLONEABLE_V2_SUCCESS, ICloneableV2} from "rain-factory-0.1.1/src/interface/ICloneableV2.sol";
@@ -72,6 +72,26 @@ error ZeroVaultSupply();
 /// price is never a valid Chainlink-compatible answer.
 error ZeroVaultSharePrice();
 
+/// @dev Error raised when the vault holds zero assets at a checkpoint: a
+/// zero ratio can never be a valid pricing anchor.
+error ZeroVaultAssets();
+
+/// @dev Error raised when the vault ratio has no valid anchor: either one was
+/// never captured (vault empty or mid-pause at init and `checkpointRatio` not
+/// yet called), or a corporate action has completed since the anchor was
+/// taken. Serving stops (fails closed) until `checkpointRatio` re-anchors the
+/// post-action ratio.
+error VaultRatioNotAnchored();
+
+/// @dev Error raised when the live vault ratio falls outside the drift band
+/// around the anchored ratio. Signals an UNSCHEDULED NAV change — most
+/// plausibly an erroneous direct transfer into the vault ("donation") — which
+/// must be reviewed before prices are served again. See the contract NatSpec
+/// ("Vault trust model") for the recovery paths.
+/// @param currentRatio The live `totalAssets/totalSupply` ratio (Rain float).
+/// @param anchorRatio The anchored ratio the band is centred on (Rain float).
+error VaultRatioOutOfBand(Float currentRatio, Float anchorRatio);
+
 /// @dev Error raised when the vault share price overflows int256.
 /// @param price8 The unsigned 8-decimal share price that wouldn't fit.
 error VaultSharePriceOverflow(uint256 price8);
@@ -92,7 +112,10 @@ error HistoricalRoundDataUnsupported(uint80 roundId);
 /// @param vault The ERC-4626 vault address whose shares we're pricing.
 /// `vault.totalAssets() / vault.totalSupply()` is the share-to-asset ratio
 /// applied on top of the DIA price. For a wtStock-style wrapper this
-/// captures the post-corporate-action NAV bump.
+/// captures the post-corporate-action NAV bump. NOTE the wtStock wrapper's
+/// `totalAssets()` is raw `balanceOf` (donation-movable BY DESIGN — NAV bumps
+/// arrive as transfers); the ratio drift band below is what gates it. See the
+/// contract NatSpec ("Vault trust model").
 /// @param maxAge Maximum acceptable DIA push age in seconds.
 /// `block.timestamp - timestamp >= maxAge` reverts `DIAPriceStale` (the edge
 /// instant fails closed — a push exactly `maxAge` old is stale). Immutable
@@ -112,6 +135,15 @@ error HistoricalRoundDataUnsupported(uint80 roundId);
 /// is safe: the staleness check rejects the `maxAge` edge, so at pause-lift the
 /// oldest still-acceptable push is strictly newer than `effectiveTime`. A
 /// margin above `maxAge` is still recommended as defence-in-depth.
+/// @param maxRatioDriftPerDayBps Width of the vault-ratio sanity band in
+/// basis points per day, accrued linearly since the last anchor. Between
+/// corporate actions the live `totalAssets/totalSupply` ratio must stay
+/// within `anchorRatio * (1 ± drift)` where
+/// `drift = maxRatioDriftPerDayBps * elapsed / 1 days / 10000`; a read
+/// outside the band reverts `VaultRatioOutOfBand` (fails closed). Zero is a
+/// valid (strictest) setting — the ratio may then only move via completed
+/// corporate actions — but a small non-zero value is recommended to absorb
+/// deposit/withdraw rounding dust. See `checkpointRatio`.
 /// @dev The corporate-actions vault is NOT a config field: it is derived as
 /// `IERC4626(vault).asset()` — the tStock the wtStock wraps, which is the
 /// contract that implements `ICorporateActionsV1`. Deriving it removes a
@@ -124,6 +156,7 @@ struct DIAVaultOracleConfig {
     uint256 actionTypeMask;
     uint64 pauseTimeBefore;
     uint64 pauseTimeAfter;
+    uint32 maxRatioDriftPerDayBps;
 }
 
 /// @title DIAVaultOracle
@@ -140,6 +173,40 @@ struct DIAVaultOracleConfig {
 /// post-split rebalance in the underlying `tStock`). Performed in Rain float
 /// space throughout so neither operand can overflow uint256; the conversion to
 /// fixed-point 8dp happens only at the final return.
+///
+/// Vault trust model (donations & the ratio band): the priced `vault` is a
+/// `wtStock` wrapper whose `totalAssets()` IS raw
+/// `IERC20(asset()).balanceOf(vault)` (the OZ ERC-4626 default). Direct
+/// transfers into the vault ("donations") therefore DO move the share ratio —
+/// by design: NAV bumps (dividend reinvestment, post-action rebalances) are
+/// delivered as exactly such transfers. The classic ERC-4626
+/// donation-inflation surface is real here and is gated by defence in depth,
+/// not by an accounted ledger:
+///
+/// 1. tStock transfers are authorizer-gated upstream. There is no
+///    permissionless donation path; only authorised holders (APs, MMs, KYC'd
+///    users) can move tStock at all, so inflating the ratio requires an
+///    authorised (or erroneous) transfer, not an anonymous attacker.
+/// 2. Every scheduled NAV event is a corporate action on the tStock
+///    (`ICorporateActionsV1`, e.g. splits and stables dividends): reads pause
+///    around its `effectiveTime`, and a completed action stops price serving
+///    (`VaultRatioNotAnchored`) until `checkpointRatio` re-anchors the
+///    post-action ratio.
+/// 3. Between actions the live ratio is gated by a drift band around the last
+///    anchor (`maxRatioDriftPerDayBps`, linearly accrued). An unscheduled
+///    ratio move beyond the band — most plausibly an erroneous direct
+///    transfer — makes every read revert `VaultRatioOutOfBand` (fail closed)
+///    until the cause is reviewed; if the new NAV is confirmed real, ops
+///    re-anchor via a corporate action (or redeploy for pathological cases).
+///
+/// Residual risk (documented, accepted): between a completed action and its
+/// re-anchoring `checkpointRatio` call the band is suspended, so a donation
+/// landed in that window is baked into the new anchor. The window is
+/// ops-bounded (checkpoint immediately after the pause lifts) and the
+/// donation surface is authorizer-gated, so it is not permissionlessly
+/// reachable. Arbitrary third-party ERC-4626 vaults remain OUTSIDE the trust
+/// model: nothing here defends a vault whose transfer path is permissionless.
+/// See `_vaultSharePrice` and `checkpointRatio` for the mechanics.
 ///
 /// Auto-pause: on every read the oracle consults `ICorporateActionsV1` on the
 /// corporate-actions vault — derived as the priced vault's `asset()`, i.e. the
@@ -193,6 +260,15 @@ contract DIAVaultOracle is AggregatorV2V3Interface, ICloneableV2, Initializable 
         uint64 pauseTimeBefore;
         // Seconds after a completed action's effectiveTime to keep pausing.
         uint64 pauseTimeAfter;
+        // Width of the vault-ratio sanity band in bps/day (see config NatSpec).
+        uint32 maxRatioDriftPerDayBps;
+        // The anchored vault ratio the drift band is centred on (Rain float).
+        Float anchorRatio;
+        // Timestamp the anchor was taken at; 0 = no valid anchor (fail closed).
+        uint64 anchorTime;
+        // `completedActionCount()` on the corporate-actions vault at anchor
+        // time. Any increase invalidates the anchor until re-checkpointed.
+        uint256 anchorCompletedActionCount;
     }
 
     // keccak256(abi.encode(uint256(keccak256("st0x.diavaultoracle.main")) - 1)) & ~bytes32(uint256(0xff))
@@ -209,6 +285,14 @@ contract DIAVaultOracle is AggregatorV2V3Interface, ICloneableV2, Initializable 
     /// @param sender The caller that initialized the proxy.
     /// @param config The initialization configuration.
     event DIAVaultOracleInitialized(address indexed sender, DIAVaultOracleConfig config);
+
+    /// @notice Emitted when the vault-ratio anchor moves — at initialize (if
+    /// the vault is already seeded) and on every successful `checkpointRatio`.
+    /// @param sender The caller that moved the anchor.
+    /// @param ratio The newly anchored ratio (Rain float).
+    /// @param completedActionCount The corporate-actions completed count the
+    /// anchor is valid for.
+    event VaultRatioCheckpointed(address indexed sender, Float ratio, uint256 completedActionCount);
 
     constructor() {
         _disableInitializers();
@@ -252,6 +336,27 @@ contract DIAVaultOracle is AggregatorV2V3Interface, ICloneableV2, Initializable 
     /// @notice Seconds after a completed action's `effectiveTime` to pause.
     function pauseTimeAfter() public view returns (uint64) {
         return _main().pauseTimeAfter;
+    }
+
+    /// @notice Width of the vault-ratio sanity band in bps/day.
+    function maxRatioDriftPerDayBps() public view returns (uint32) {
+        return _main().maxRatioDriftPerDayBps;
+    }
+
+    /// @notice The anchored vault ratio the drift band is centred on.
+    function anchorRatio() public view returns (Float) {
+        return _main().anchorRatio;
+    }
+
+    /// @notice Timestamp of the current anchor; 0 = no valid anchor.
+    function anchorTime() public view returns (uint64) {
+        return _main().anchorTime;
+    }
+
+    /// @notice `completedActionCount()` on the corporate-actions vault when
+    /// the anchor was taken.
+    function anchorCompletedActionCount() public view returns (uint256) {
+        return _main().anchorCompletedActionCount;
     }
 
     /// @notice Documents the typed signature of the initialize function. Per
@@ -312,9 +417,12 @@ contract DIAVaultOracle is AggregatorV2V3Interface, ICloneableV2, Initializable 
         // missing facet (ABI-decode revert) or a mask with no bits in the
         // upstream VALID_ACTION_TYPES_MASK (InvalidMask) — reverts THIS deploy
         // transaction rather than every future consumer read against immutable
-        // config. Result discarded; only reachability is asserted.
+        // config. The pause flag is reused below to decide whether the ratio
+        // anchor may be captured at init.
+        // The window's `effectiveTime` is deliberately unused at init — only
+        // the pause flag gates the anchor capture below.
         // slither-disable-next-line unused-return
-        LibCorporateActionsPause.inPauseWindow(
+        (bool pausedAtInit,) = LibCorporateActionsPause.inPauseWindow(
             derivedCorporateActionsVault, config.actionTypeMask, config.pauseTimeBefore, config.pauseTimeAfter
         );
 
@@ -327,13 +435,38 @@ contract DIAVaultOracle is AggregatorV2V3Interface, ICloneableV2, Initializable 
         $.actionTypeMask = config.actionTypeMask;
         $.pauseTimeBefore = config.pauseTimeBefore;
         $.pauseTimeAfter = config.pauseTimeAfter;
+        $.maxRatioDriftPerDayBps = config.maxRatioDriftPerDayBps;
 
         emit DIAVaultOracleInitialized(msg.sender, config);
+
+        // Capture the ratio anchor now if the vault is already seeded and no
+        // pause window is open (a mid-pause ratio may be transitional). An
+        // unseeded or mid-pause deploy leaves the anchor unset: reads fail
+        // closed (`VaultRatioNotAnchored`) until `checkpointRatio` is called.
+        uint256 initTotalAssets = IERC4626(config.vault).totalAssets();
+        uint256 initTotalSupply = IERC4626(config.vault).totalSupply();
+        if (!pausedAtInit && initTotalAssets != 0 && initTotalSupply != 0) {
+            Float initRatio = LibDecimalFloat.div(
+                LibDecimalFloat.fromFixedDecimalLosslessPacked(initTotalAssets, 0),
+                LibDecimalFloat.fromFixedDecimalLosslessPacked(initTotalSupply, 0)
+            );
+            uint256 completed = ICorporateActionsV1(derivedCorporateActionsVault).completedActionCount();
+            $.anchorRatio = initRatio;
+            $.anchorTime = uint64(block.timestamp);
+            $.anchorCompletedActionCount = completed;
+            emit VaultRatioCheckpointed(msg.sender, initRatio, completed);
+        }
 
         return ICLONEABLE_V2_SUCCESS;
     }
 
     /// @inheritdoc AggregatorV2V3Interface
+    /// @dev Deliberate deviation from the Chainlink-style pair-string
+    /// convention: this returns the BARE DIA feed symbol (e.g. `"COIN"`), NOT
+    /// a `"SYMBOL / USD"` pair string, because DIA keys its feeds by the bare
+    /// symbol and that is the single source of truth here. Integrators that
+    /// expect a Chainlink-formatted pair string must adjust. The interface
+    /// NatSpec is worded so it does not contradict this.
     function description() external view override returns (string memory) {
         return _main().symbol;
     }
@@ -407,26 +540,136 @@ contract DIAVaultOracle is AggregatorV2V3Interface, ICloneableV2, Initializable 
         // Comparing block.timestamp against the DIA push timestamp is the whole
         // point of the staleness check; sub-maxAge miner drift is immaterial
         // against a maxAge measured in hours. This is not a false-positive
-        // dependence on block.timestamp for value/authorisation. The edge
-        // instant fails closed (`>=`): a push exactly `maxAge` old is STALE.
-        // This is deliberate — it is what makes the cross-epoch invariant
+        // dependence on block.timestamp for value/authorisation.
+        //
+        // A push timestamped at or before `now` applies the `maxAge` window. A
+        // push timestamped in the FUTURE (a feed running slightly ahead, or a
+        // chain-time regression / reorg) is treated as fresh (age 0), never
+        // stale: the `<= block.timestamp` guard short-circuits the subtraction
+        // so it can never underflow into a bare `Panic(0x11)` that integrators
+        // cannot disambiguate from `DIAPriceStale` / `DIAPriceNotSet`.
+        //
+        // The staleness edge fails closed (`>=`): a push exactly `maxAge` old is
+        // STALE. This is deliberate — it makes the cross-epoch invariant
         // (`pauseTimeAfter >= maxAge`, see the contract NatSpec) airtight at the
-        // exact-equality boundary, and it matches the fail-closed staleness
+        // exact-equality boundary, and matches the fail-closed staleness
         // convention (the edge counts as stale).
         // slither-disable-next-line timestamp
-        if (block.timestamp - uint256(timestamp) >= $.maxAge) revert DIAPriceStale(uint256(timestamp));
+        if (uint256(timestamp) <= block.timestamp && block.timestamp - uint256(timestamp) >= $.maxAge) {
+            revert DIAPriceStale(uint256(timestamp));
+        }
+    }
+
+    /// @notice Re-anchor the vault-ratio drift band on the live ratio.
+    /// Permissionless: the band itself is what keeps the call safe.
+    ///
+    /// Two paths:
+    /// - After a corporate action: once the pause window has lifted, the live
+    ///   (post-action) ratio is accepted outright and the anchor moves to it —
+    ///   this is the ONLY way serving resumes after
+    ///   `completedActionCount()` advances (`VaultRatioNotAnchored`).
+    /// - Between actions: the call must itself pass the same drift band that
+    ///   gates reads, so an out-of-band donation cannot be laundered into a
+    ///   new anchor; it re-bases the linear drift accrual at the current
+    ///   ratio (useful housekeeping to keep the band tight).
+    ///
+    /// Reverts `OraclePausedCorporateAction` inside a pause window (a
+    /// mid-pause ratio may be transitional), `ZeroVaultSupply` /
+    /// `ZeroVaultAssets` on an unseeded vault, and `VaultRatioOutOfBand` when
+    /// no action completed and the live ratio exceeds the accrued band.
+    function checkpointRatio() external {
+        _validateNotPaused();
+        MainStorage storage $ = _main();
+        IERC4626 vaultContract = IERC4626($.vault);
+        uint256 totalAssets = vaultContract.totalAssets();
+        uint256 totalSupply = vaultContract.totalSupply();
+        if (totalSupply == 0) revert ZeroVaultSupply();
+        if (totalAssets == 0) revert ZeroVaultAssets();
+
+        Float ratio = LibDecimalFloat.div(
+            LibDecimalFloat.fromFixedDecimalLosslessPacked(totalAssets, 0),
+            LibDecimalFloat.fromFixedDecimalLosslessPacked(totalSupply, 0)
+        );
+        uint256 completed = ICorporateActionsV1($.corporateActionsVault).completedActionCount();
+
+        // Between actions the anchor may only move within the band; across a
+        // completed action (or from an unset anchor) the live ratio is
+        // accepted outright — see the function NatSpec for why.
+        if ($.anchorTime != 0 && completed == $.anchorCompletedActionCount) {
+            _validateRatioInBand($, ratio);
+        }
+
+        $.anchorRatio = ratio;
+        $.anchorTime = uint64(block.timestamp);
+        $.anchorCompletedActionCount = completed;
+        emit VaultRatioCheckpointed(msg.sender, ratio, completed);
+    }
+
+    /// @dev Validate the anchor is current (set, and no corporate action has
+    /// completed since it was taken) then check `ratio` against the accrued
+    /// drift band. Fails closed on every branch.
+    function _validateRatioAnchored(MainStorage storage $, Float ratio) internal view {
+        if ($.anchorTime == 0) revert VaultRatioNotAnchored();
+        if (ICorporateActionsV1($.corporateActionsVault).completedActionCount() != $.anchorCompletedActionCount) {
+            revert VaultRatioNotAnchored();
+        }
+        _validateRatioInBand($, ratio);
+    }
+
+    /// @dev Check `ratio` against `anchorRatio * (1 ± drift)` where
+    /// `drift = maxRatioDriftPerDayBps * elapsed / 1 days / 10000`, all in
+    /// Rain float space. The band is symmetric; once the accrued drift
+    /// exceeds 1 the lower bound goes non-positive and only the upper bound
+    /// binds (a ratio is always positive here).
+    function _validateRatioInBand(MainStorage storage $, Float ratio) internal view {
+        // anchorTime <= block.timestamp by construction (stored from
+        // block.timestamp). uint32 bps * uint64 elapsed < 2^96 — no overflow.
+        // Elapsed wall-clock time since the anchor is the whole point of a
+        // linearly accrued drift allowance; sub-band miner drift is immaterial
+        // against an allowance measured in bps/day. Not a value/authorisation
+        // dependence on block.timestamp.
+        // slither-disable-next-line timestamp
+        uint256 elapsed = block.timestamp - $.anchorTime;
+        Float drift = LibDecimalFloat.div(
+            LibDecimalFloat.fromFixedDecimalLosslessPacked(uint256($.maxRatioDriftPerDayBps) * elapsed, 0),
+            LibDecimalFloat.fromFixedDecimalLosslessPacked(10_000 * 1 days, 0)
+        );
+        Float one = LibDecimalFloat.packLossless(1, 0);
+        Float anchor = $.anchorRatio;
+        Float upper = LibDecimalFloat.mul(anchor, LibDecimalFloat.add(one, drift));
+        Float lower = LibDecimalFloat.mul(anchor, LibDecimalFloat.sub(one, drift));
+        // The band bounds derive from elapsed wall-clock time (see above) —
+        // same justification, anchored where slither flags the comparison.
+        // slither-disable-next-line timestamp
+        if (LibDecimalFloat.gt(ratio, upper) || LibDecimalFloat.lt(ratio, lower)) {
+            revert VaultRatioOutOfBand(ratio, anchor);
+        }
     }
 
     /// @dev Compute vault share price from a DIA reading via Rain float math
     /// so neither operand can overflow uint256. DIA prices are 18-decimal
     /// `uint128`. The vault ratio is `totalAssets / totalSupply`. Output is
     /// 8-decimal `int256` per Chainlink `latestAnswer` convention.
+    ///
+    /// Donation / share-inflation trust model: this reads `totalAssets()`
+    /// directly and feeds the resulting share price to lending markets, where
+    /// an inflatable ratio lets a borrower draw against phantom collateral.
+    /// The wtStock's `totalAssets()` IS raw `balanceOf` — donations move it by
+    /// design (that is the NAV-bump delivery mechanism) — so the ratio is
+    /// validated on every read against the anchored drift band
+    /// (`_validateRatioAnchored`): an unscheduled out-of-band move reverts
+    /// `VaultRatioOutOfBand`, and a ratio without a current anchor (none
+    /// captured yet, or a corporate action completed since) reverts
+    /// `VaultRatioNotAnchored`. See the contract NatSpec ("Vault trust
+    /// model") for the full defence-in-depth argument and residual risk. The
+    /// behaviour is pinned by the `testVaultRatioBand*` suite.
     function _vaultSharePrice(uint128 diaPrice) internal view returns (int256) {
         // DIA's value is 18-decimal uint128 — pack as a float with decimal
         // count 18 to recover the natural quantity.
         Float priceFloat = LibDecimalFloat.fromFixedDecimalLosslessPacked(uint256(diaPrice), 18);
 
-        IERC4626 vaultContract = IERC4626(_main().vault);
+        MainStorage storage $ = _main();
+        IERC4626 vaultContract = IERC4626($.vault);
         uint256 totalAssets = vaultContract.totalAssets();
         uint256 totalSupply = vaultContract.totalSupply();
 
@@ -434,7 +677,15 @@ contract DIAVaultOracle is AggregatorV2V3Interface, ICloneableV2, Initializable 
 
         Float assetsFloat = LibDecimalFloat.fromFixedDecimalLosslessPacked(totalAssets, 0);
         Float supplyFloat = LibDecimalFloat.fromFixedDecimalLosslessPacked(totalSupply, 0);
-        Float vaultSharePriceFloat = LibDecimalFloat.div(LibDecimalFloat.mul(priceFloat, assetsFloat), supplyFloat);
+        Float ratioFloat = LibDecimalFloat.div(assetsFloat, supplyFloat);
+
+        _validateRatioAnchored($, ratioFloat);
+
+        // Rain float division is not integer division: dividing first loses no
+        // precision to truncation the way uint division would, and the ratio
+        // must exist as its own value for the band validation above.
+        // slither-disable-next-line divide-before-multiply
+        Float vaultSharePriceFloat = LibDecimalFloat.mul(priceFloat, ratioFloat);
 
         // The second return (bool lossy) is intentionally ignored — lossy
         // conversion is expected and acceptable when scaling to 8 decimals.

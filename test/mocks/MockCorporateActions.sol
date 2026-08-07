@@ -79,8 +79,14 @@ contract MockCorporateActions is ICorporateActionsV1 {
         revert("mock: not implemented");
     }
 
-    function completedActionCount() external pure override returns (uint256) {
-        revert("mock: not implemented");
+    uint256 private _completedActionCount;
+
+    function setCompletedActionCount(uint256 v) external {
+        _completedActionCount = v;
+    }
+
+    function completedActionCount() external view override returns (uint256) {
+        return _completedActionCount;
     }
 
     function nextOfType(uint256, uint256, CompletionFilter) external pure override returns (uint256, uint256, uint64) {

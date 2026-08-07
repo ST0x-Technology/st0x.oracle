@@ -91,10 +91,25 @@ DIAVaultOracle oracle = diaVaultOracleBeaconSetDeployer.newDIAVaultOracle(
         maxAge:          2 hours,
         actionTypeMask:  type(uint256).max,
         pauseTimeBefore: 1 hours,
-        pauseTimeAfter:  3 hours  // >= maxAge, with a margin (see invariant above)
+        pauseTimeAfter:  3 hours,  // >= maxAge, with a margin (see invariant above)
+        maxRatioDriftPerDayBps: 10 // vault-ratio sanity band (see below)
     })
 );
 ```
+
+> **Vault-ratio drift band (`maxRatioDriftPerDayBps`).** The wtStock's
+> `totalAssets()` is raw `balanceOf`, so direct transfers into the vault move
+> the share ratio — by design (NAV bumps are delivered as transfers), but that
+> also makes the classic ERC-4626 donation-inflation surface real. The oracle
+> anchors the ratio at deploy (and at each `checkpointRatio()`) and rejects
+> reads whose live ratio drifts outside `anchor * (1 ± bps/day accrued)` between
+> corporate actions (`VaultRatioOutOfBand`, fail closed). A completed corporate
+> action (split, dividend) stops serving until a permissionless
+> `checkpointRatio()` re-anchors on the post-action ratio
+> (`VaultRatioNotAnchored`) — call it right after the pause window lifts.
+> Scheduled NAV events all arrive as corporate actions, so the band only needs
+> headroom for rounding dust: ~10 bps/day is a sensible default; `0` is the
+> strictest valid setting (ratio may only move via corporate actions).
 
 Hand `address(oracle)` to consumers as the `AggregatorV2V3Interface` source they
 already plug Chainlink feeds into.

@@ -7,6 +7,7 @@ import {IDIAOracleV2} from "../../../src/interface/IDIAOracleV2.sol";
 import {
     DIAVaultOracle,
     DIAVaultOracleConfig,
+    VaultRatioNotAnchored,
     DIAPriceNotSet,
     DIAPriceStale,
     OraclePausedCorporateAction
@@ -39,6 +40,7 @@ contract DIAStackE2ETest is Test {
     uint64 internal constant PAUSE_BEFORE = 1 hours;
     // Cross-epoch invariant: pauseTimeAfter >= maxAge.
     uint64 internal constant PAUSE_AFTER = 2 hours;
+    uint32 constant DRIFT_BPS_PER_DAY = 100;
 
     function setUp() public {
         diaOracle = new MockDIAOracle();
@@ -47,6 +49,10 @@ contract DIAStackE2ETest is Test {
         // The oracle derives its corporate-actions vault from vault.asset()
         // (the tStock the wtStock wraps).
         vault.setAsset(address(corporateActions));
+        // Seed the vault 1:1 before the oracle deploys so `initialize`
+        // captures the ratio anchor for the drift band.
+        vault.setTotalAssets(1e18);
+        vault.setTotalSupply(1e18);
 
         DIAVaultOracleBeaconSetDeployer oracleBSD = new DIAVaultOracleBeaconSetDeployer(
             DIAVaultOracleBeaconSetDeployerConfig({
@@ -66,7 +72,8 @@ contract DIAStackE2ETest is Test {
                 maxAge: MAX_AGE,
                 actionTypeMask: type(uint256).max,
                 pauseTimeBefore: PAUSE_BEFORE,
-                pauseTimeAfter: PAUSE_AFTER
+                pauseTimeAfter: PAUSE_AFTER,
+                maxRatioDriftPerDayBps: DRIFT_BPS_PER_DAY
             })
         );
     }
@@ -105,9 +112,17 @@ contract DIAStackE2ETest is Test {
         assertEq(oracle.latestAnswer(), int256(100e8), "pre-bump");
 
         // wtStock NAV doubles — same shares now claim 2× the underlying. The
-        // vault's `totalAssets` doubles while `totalSupply` stays put.
+        // vault's `totalAssets` doubles while `totalSupply` stays put. On the
+        // real stack a bump of this size is delivered by a corporate action,
+        // so the completed count advances; the drift band fails reads closed
+        // until `checkpointRatio` re-anchors on the post-action ratio.
         vault.setTotalAssets(2e18);
+        corporateActions.setCompletedActionCount(1);
 
+        vm.expectRevert(abi.encodeWithSelector(VaultRatioNotAnchored.selector));
+        oracle.latestAnswer();
+
+        oracle.checkpointRatio();
         assertEq(oracle.latestAnswer(), int256(200e8), "post-bump");
     }
 
@@ -157,10 +172,16 @@ contract DIAStackE2ETest is Test {
         vm.expectRevert(abi.encodeWithSelector(OraclePausedCorporateAction.selector, effectiveTime));
         oracle.latestAnswer();
 
-        // Warp past the post-window. Reads work again — at the bumped
-        // NAV if one landed.
+        // Warp past the post-window. The completed action advanced the
+        // count, so reads stay failed-closed until the ratio is re-anchored —
+        // the post-action checkpoint is part of the real lifecycle.
         vm.warp(uint256(effectiveTime) + uint256(PAUSE_AFTER) + 1);
         _freshDIAAt100();
+        corporateActions.setCompletedActionCount(1);
+        vm.expectRevert(abi.encodeWithSelector(VaultRatioNotAnchored.selector));
+        oracle.latestAnswer();
+
+        oracle.checkpointRatio();
         assertEq(oracle.latestAnswer(), int256(100e8), "post-window reads restored");
     }
 
