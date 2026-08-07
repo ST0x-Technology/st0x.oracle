@@ -20,6 +20,9 @@ import {
     DIAPriceNotSet,
     DIAPriceStale,
     ZeroVaultSupply,
+    ZeroVaultAssets,
+    VaultRatioNotAnchored,
+    VaultRatioOutOfBand,
     ZeroVaultSharePrice,
     VaultSharePriceOverflow,
     HistoricalRoundDataUnsupported
@@ -43,6 +46,9 @@ contract DIAVaultOracleTest is Test {
     uint256 internal constant MAX_AGE = 1 hours;
     uint64 internal constant PAUSE_BEFORE = 3600;
     uint64 internal constant PAUSE_AFTER = 3600;
+    // 100 bps/day drift band: wide enough that same-block reads at the seeded
+    // ratio always pass, tight enough that the band tests can trip it.
+    uint32 internal constant DRIFT_BPS_PER_DAY = 100;
 
     event DIAVaultOracleInitialized(address indexed sender, DIAVaultOracleConfig config);
 
@@ -54,6 +60,12 @@ contract DIAVaultOracleTest is Test {
         // The oracle derives its corporate-actions vault from the priced
         // vault's `asset()` (the tStock the wtStock wraps).
         vault.setAsset(address(actions));
+        // Seed the vault 1:1 so `initialize` captures the ratio anchor; tests
+        // that price a different ratio set it BEFORE deploying, so the anchor
+        // matches. Band behaviour itself is pinned in the `testVaultRatioBand*`
+        // suite.
+        vault.setTotalAssets(1e18);
+        vault.setTotalSupply(1e18);
         // Warp far enough in that `block.timestamp - maxAge` doesn't underflow.
         vm.warp(1_000_000);
     }
@@ -80,7 +92,8 @@ contract DIAVaultOracleTest is Test {
             maxAge: MAX_AGE,
             actionTypeMask: ACTION_TYPE_STOCK_SPLIT_V1,
             pauseTimeBefore: PAUSE_BEFORE,
-            pauseTimeAfter: PAUSE_AFTER
+            pauseTimeAfter: PAUSE_AFTER,
+            maxRatioDriftPerDayBps: DRIFT_BPS_PER_DAY
         });
     }
 
@@ -360,46 +373,214 @@ contract DIAVaultOracleTest is Test {
     // -------- latestAnswer happy path --------
 
     function testLatestAnswerHappyPath() external {
-        DIAVaultOracle oracle = _deployProxy(_defaultConfig());
-        // DIA: $100 at 18dp.
+        // DIA: $100 at 18dp. Vault: 2 assets per share — set BEFORE deploy
+        // so the ratio anchor is captured at 2:1.
         diaOracle.setValue(SYMBOL, 100e18, uint128(block.timestamp));
-        // Vault: 2 assets per share.
         vault.setTotalAssets(2e18);
         vault.setTotalSupply(1e18);
+        DIAVaultOracle oracle = _deployProxy(_defaultConfig());
 
         // 100 * 2 / 1 = 200, scaled to 8dp = 200e8.
         int256 answer = oracle.latestAnswer();
         assertEq(answer, int256(200e8));
     }
 
-    /// @notice Donation / share-price-inflation trust model (issue #262). The
-    /// oracle feeds `totalAssets/totalSupply` straight into a lending-market
-    /// price, so an inflatable `totalAssets` would let a borrower draw against
-    /// phantom collateral. This pins the invariant the contract NatSpec relies
-    /// on: the priced vault's `totalAssets()` is an ACCOUNTED quantity, NOT raw
-    /// `balanceOf`, so a direct token/ETH donation to the vault cannot move it.
-    /// Sending value to the vault address here leaves `totalAssets()` — and
-    /// hence the reported share price — unchanged; only an accounted mint (the
-    /// `setTotalAssets` setter, standing in for a real NAV update) does. An
-    /// ERC-4626 whose `totalAssets` tracked `balanceOf` would fail this test,
-    /// documenting that such a vault is outside the trust model.
-    function testVaultTotalAssetsSourceIsAccounted() external {
-        DIAVaultOracle oracle = _deployProxy(_defaultConfig());
+    // -------- vault-ratio drift band (issue #262 option b) --------
+    //
+    // The production wtStock's `totalAssets()` IS raw `balanceOf` — donations
+    // move the ratio by design (NAV-bump delivery). The oracle therefore
+    // gates the ratio with a drift band anchored at the last checkpoint and
+    // invalidated by completed corporate actions. `setTotalAssets` here
+    // stands in for exactly what a real donation does to a `balanceOf`-backed
+    // vault: it moves the ratio the oracle reads.
+
+    /// @notice A ratio drift inside the accrued band is served: donations DO
+    /// move the price (they are the NAV-bump mechanism), the band only caps
+    /// how fast the ratio may move between corporate actions.
+    function testVaultRatioBandDriftWithinBandServed() external {
         diaOracle.setValue(SYMBOL, 100e18, uint128(block.timestamp));
-        // Accounted state: 1 asset per share → price 100e8.
-        vault.setTotalAssets(1e18);
-        vault.setTotalSupply(1e18);
-        int256 before = oracle.latestAnswer();
-        assertEq(before, int256(100e8), "baseline accounted price");
+        DIAVaultOracle oracle = _deployProxy(_defaultConfig());
+        assertEq(oracle.latestAnswer(), int256(100e8), "anchored 1:1 baseline");
 
-        // Simulate a hostile donation: force ETH onto the vault address and
-        // grow its raw balance. `totalAssets()` here is an accounted setter,
-        // NOT `balanceOf`, so it does not move — a `balanceOf`-derived vault
-        // would jump and inflate the price. The reported price is unchanged.
-        vm.deal(address(vault), 1_000_000 ether);
+        // One day accrues 100 bps of allowed drift; a 0.5% NAV bump passes
+        // and the price moves with it.
+        vm.warp(block.timestamp + 1 days);
+        diaOracle.setValue(SYMBOL, 100e18, uint128(block.timestamp));
+        vault.setTotalAssets(1.005e18);
+        assertEq(oracle.latestAnswer(), int256(100.5e8), "in-band NAV bump is served");
+    }
 
-        int256 afterDonation = oracle.latestAnswer();
-        assertEq(afterDonation, before, "a donation must not inflate an accounted-totalAssets share price");
+    /// @notice A same-block ratio jump has zero accrued band and reverts:
+    /// this is the donation-inflation guard. An erroneous transfer that bumps
+    /// the ratio immediately stops price serving (fail closed) instead of
+    /// feeding inflated collateral values to lending markets.
+    function testVaultRatioBandSameBlockJumpReverts() external {
+        diaOracle.setValue(SYMBOL, 100e18, uint128(block.timestamp));
+        DIAVaultOracle oracle = _deployProxy(_defaultConfig());
+        assertEq(oracle.latestAnswer(), int256(100e8));
+
+        // Donation doubles the vault balance in the same block: 2x ratio.
+        vault.setTotalAssets(2e18);
+        vm.expectPartialRevert(VaultRatioOutOfBand.selector);
+        oracle.latestAnswer();
+    }
+
+    /// @notice Drift beyond the linearly accrued band reverts; the band
+    /// accrues with elapsed time since the anchor.
+    function testVaultRatioBandDriftBeyondBandReverts() external {
+        diaOracle.setValue(SYMBOL, 100e18, uint128(block.timestamp));
+        DIAVaultOracle oracle = _deployProxy(_defaultConfig());
+
+        // Two days accrue 200 bps; 1.5% passes, 2.5% trips.
+        vm.warp(block.timestamp + 2 days);
+        diaOracle.setValue(SYMBOL, 100e18, uint128(block.timestamp));
+        vault.setTotalAssets(1.015e18);
+        assertEq(oracle.latestAnswer(), int256(101.5e8), "1.5% within 2-day band");
+
+        vault.setTotalAssets(1.025e18);
+        vm.expectPartialRevert(VaultRatioOutOfBand.selector);
+        oracle.latestAnswer();
+    }
+
+    /// @notice The band is symmetric: an out-of-band ratio DROP also stops
+    /// serving (an unscheduled NAV loss is as anomalous as a bump).
+    function testVaultRatioBandDownwardJumpReverts() external {
+        diaOracle.setValue(SYMBOL, 100e18, uint128(block.timestamp));
+        DIAVaultOracle oracle = _deployProxy(_defaultConfig());
+
+        vault.setTotalAssets(0.5e18);
+        vm.expectPartialRevert(VaultRatioOutOfBand.selector);
+        oracle.latestAnswer();
+    }
+
+    /// @notice A zero drift config is the strictest valid setting: between
+    /// corporate actions the ratio may not move at all.
+    function testVaultRatioBandZeroDriftIsStrict() external {
+        diaOracle.setValue(SYMBOL, 100e18, uint128(block.timestamp));
+        DIAVaultOracleConfig memory config = _defaultConfig();
+        config.maxRatioDriftPerDayBps = 0;
+        DIAVaultOracle oracle = _deployProxy(config);
+        assertEq(oracle.latestAnswer(), int256(100e8), "unchanged ratio serves");
+
+        vm.warp(block.timestamp + 365 days);
+        diaOracle.setValue(SYMBOL, 100e18, uint128(block.timestamp));
+        assertEq(oracle.latestAnswer(), int256(100e8), "still serves a year later");
+
+        vault.setTotalAssets(1e18 + 1e15); // +10 bps
+        vm.expectPartialRevert(VaultRatioOutOfBand.selector);
+        oracle.latestAnswer();
+    }
+
+    /// @notice A completed corporate action invalidates the anchor: reads
+    /// fail closed (`VaultRatioNotAnchored`) until `checkpointRatio`
+    /// re-anchors, then the post-action ratio is served.
+    function testVaultRatioBandCompletedActionRequiresRecheckpoint() external {
+        diaOracle.setValue(SYMBOL, 100e18, uint128(block.timestamp));
+        DIAVaultOracle oracle = _deployProxy(_defaultConfig());
+        assertEq(oracle.latestAnswer(), int256(100e8));
+
+        // A 2:1-split-style rebase: ratio doubles AND the completed-action
+        // count advances. (The pause window around `effectiveTime` is pinned
+        // elsewhere; here the window is already past.)
+        vault.setTotalAssets(2e18);
+        actions.setCompletedActionCount(1);
+
+        vm.expectRevert(abi.encodeWithSelector(VaultRatioNotAnchored.selector));
+        oracle.latestAnswer();
+
+        oracle.checkpointRatio();
+        assertEq(oracle.latestAnswer(), int256(200e8), "post-action ratio served after re-anchor");
+        assertEq(oracle.anchorCompletedActionCount(), 1, "anchor tracks the completed count");
+    }
+
+    /// @notice Without a completed action, `checkpointRatio` is held to the
+    /// same band as reads — an out-of-band donation cannot be laundered into
+    /// a new anchor by checkpointing it.
+    function testVaultRatioBandCheckpointRejectsOutOfBandJump() external {
+        diaOracle.setValue(SYMBOL, 100e18, uint128(block.timestamp));
+        DIAVaultOracle oracle = _deployProxy(_defaultConfig());
+
+        vault.setTotalAssets(2e18);
+        vm.expectPartialRevert(VaultRatioOutOfBand.selector);
+        oracle.checkpointRatio();
+    }
+
+    /// @notice An in-band checkpoint re-bases the drift accrual: after it,
+    /// the band is centred on the new ratio and further drift is measured
+    /// from there.
+    function testVaultRatioBandCheckpointRebasesAccrual() external {
+        diaOracle.setValue(SYMBOL, 100e18, uint128(block.timestamp));
+        DIAVaultOracle oracle = _deployProxy(_defaultConfig());
+
+        vm.warp(block.timestamp + 1 days);
+        diaOracle.setValue(SYMBOL, 100e18, uint128(block.timestamp));
+        vault.setTotalAssets(1.005e18);
+        oracle.checkpointRatio();
+        assertEq(oracle.anchorTime(), uint64(block.timestamp), "anchor re-based");
+
+        // The fresh anchor has zero accrued band again: the same +0.5% step
+        // that just passed now reverts same-block.
+        vault.setTotalAssets(1.010025e18); // 1.005 * 1.005
+        vm.expectPartialRevert(VaultRatioOutOfBand.selector);
+        oracle.latestAnswer();
+    }
+
+    /// @notice `checkpointRatio` refuses to run inside a corporate-action
+    /// pause window: a mid-pause ratio may be transitional and must not
+    /// become the anchor.
+    function testVaultRatioBandCheckpointRevertsDuringPause() external {
+        DIAVaultOracle oracle = _deployProxy(_defaultConfig());
+        uint64 effectiveTime = uint64(block.timestamp);
+        actions.setLatestCompleted(1, ACTION_TYPE_STOCK_SPLIT_V1, effectiveTime);
+
+        vm.expectRevert(abi.encodeWithSelector(OraclePausedCorporateAction.selector, effectiveTime));
+        oracle.checkpointRatio();
+    }
+
+    /// @notice Deploying against an unseeded vault leaves the anchor unset:
+    /// reads fail closed until the vault is seeded and `checkpointRatio`
+    /// establishes the first anchor.
+    function testVaultRatioBandUnseededInitFailsClosedUntilCheckpoint() external {
+        MockERC4626 freshVault = new MockERC4626();
+        freshVault.setAsset(address(actions));
+        DIAVaultOracleConfig memory config = _defaultConfig();
+        config.vault = address(freshVault);
+        DIAVaultOracle oracle = _deployProxy(config);
+        assertEq(oracle.anchorTime(), 0, "no anchor captured at unseeded init");
+
+        diaOracle.setValue(SYMBOL, 100e18, uint128(block.timestamp));
+        freshVault.setTotalAssets(1e18);
+        freshVault.setTotalSupply(1e18);
+        vm.expectRevert(abi.encodeWithSelector(VaultRatioNotAnchored.selector));
+        oracle.latestAnswer();
+
+        oracle.checkpointRatio();
+        assertEq(oracle.latestAnswer(), int256(100e8), "served once anchored");
+    }
+
+    /// @notice Deploying inside a pause window must NOT capture the (possibly
+    /// transitional) ratio as the anchor.
+    function testVaultRatioBandInitDuringPauseLeavesUnanchored() external {
+        uint64 effectiveTime = uint64(block.timestamp);
+        actions.setLatestCompleted(1, ACTION_TYPE_STOCK_SPLIT_V1, effectiveTime);
+        DIAVaultOracle oracle = _deployProxy(_defaultConfig());
+        assertEq(oracle.anchorTime(), 0, "mid-pause init must not anchor");
+    }
+
+    /// @notice `checkpointRatio` rejects unseeded vault states.
+    function testVaultRatioBandCheckpointRevertsUnseeded() external {
+        MockERC4626 freshVault = new MockERC4626();
+        freshVault.setAsset(address(actions));
+        DIAVaultOracleConfig memory config = _defaultConfig();
+        config.vault = address(freshVault);
+        DIAVaultOracle oracle = _deployProxy(config);
+
+        vm.expectRevert(ZeroVaultSupply.selector);
+        oracle.checkpointRatio();
+
+        freshVault.setTotalSupply(1e18);
+        vm.expectRevert(ZeroVaultAssets.selector);
+        oracle.checkpointRatio();
     }
 
     // -------- latestAnswer DIA not set --------
@@ -618,10 +799,10 @@ contract DIAVaultOracleTest is Test {
     /// is RETURNED, not rejected by the overflow guard — pins the non-revert
     /// side of the `price8 > int256.max` boundary.
     function testLatestAnswerLargePriceBelowIntMaxReturns() external {
-        DIAVaultOracle oracle = _deployProxy(_defaultConfig());
         diaOracle.setValue(SYMBOL, 1e38, uint128(block.timestamp));
         vault.setTotalAssets(5e48);
         vault.setTotalSupply(1);
+        DIAVaultOracle oracle = _deployProxy(_defaultConfig());
         assertEq(oracle.latestAnswer(), int256(5e76));
     }
 
@@ -640,13 +821,13 @@ contract DIAVaultOracleTest is Test {
     // -------- latestAnswer zero share price --------
 
     function testLatestAnswerRevertsZeroSharePrice() external {
-        DIAVaultOracle oracle = _deployProxy(_defaultConfig());
         // diaPrice = 1 (raw uint with 18dp = 1e-18 USD).
         // totalAssets = 1, totalSupply = 1e18 → ratio = 1e-18.
         // Final = 1e-18 * 1e-18 = 1e-36, scaled to 8dp -> 0.
         diaOracle.setValue(SYMBOL, 1, uint128(block.timestamp));
         vault.setTotalAssets(1);
         vault.setTotalSupply(1e18);
+        DIAVaultOracle oracle = _deployProxy(_defaultConfig());
 
         vm.expectRevert(ZeroVaultSharePrice.selector);
         oracle.latestAnswer();
@@ -672,10 +853,10 @@ contract DIAVaultOracleTest is Test {
     /// conversion are lossless, giving an exact `price8 == 7e76` — so we assert
     /// the full selector + args rather than the bare selector.
     function testLatestAnswerRevertsVaultSharePriceOverflow() external {
-        DIAVaultOracle oracle = _deployProxy(_defaultConfig());
         diaOracle.setValue(SYMBOL, 1e38, uint128(block.timestamp));
         vault.setTotalAssets(7e48);
         vault.setTotalSupply(1);
+        DIAVaultOracle oracle = _deployProxy(_defaultConfig());
 
         vm.expectRevert(abi.encodeWithSelector(VaultSharePriceOverflow.selector, uint256(7e76)));
         oracle.latestAnswer();
@@ -684,11 +865,11 @@ contract DIAVaultOracleTest is Test {
     // -------- latestRoundData --------
 
     function testLatestRoundData() external {
-        DIAVaultOracle oracle = _deployProxy(_defaultConfig());
         uint128 timestamp = uint128(block.timestamp - 5);
         diaOracle.setValue(SYMBOL, 100e18, timestamp);
         vault.setTotalAssets(2e18);
         vault.setTotalSupply(1e18);
+        DIAVaultOracle oracle = _deployProxy(_defaultConfig());
 
         (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound) =
             oracle.latestRoundData();
@@ -701,10 +882,10 @@ contract DIAVaultOracleTest is Test {
     }
 
     function testLatestRoundDataMatchesLatestAnswer() external {
-        DIAVaultOracle oracle = _deployProxy(_defaultConfig());
         diaOracle.setValue(SYMBOL, 123e18, uint128(block.timestamp));
         vault.setTotalAssets(7e18);
         vault.setTotalSupply(3e18);
+        DIAVaultOracle oracle = _deployProxy(_defaultConfig());
 
         int256 expected = oracle.latestAnswer();
         (, int256 answer,,,) = oracle.latestRoundData();

@@ -52,6 +52,7 @@ contract DIAVaultOracleForkBaseTest is Test {
     // subject is the corporate-action vault, not DIA.
     uint256 constant MAX_AGE = 1 hours;
     uint64 constant PAUSE_AFTER = 1 hours;
+    uint32 constant DRIFT_BPS_PER_DAY = 100;
 
     function _deployOracle() internal returns (DIAVaultOracle) {
         DIAVaultOracleBeaconSetDeployer bsd = new DIAVaultOracleBeaconSetDeployer(
@@ -67,7 +68,8 @@ contract DIAVaultOracleForkBaseTest is Test {
                 maxAge: MAX_AGE,
                 actionTypeMask: type(uint256).max,
                 pauseTimeBefore: PAUSE_BEFORE,
-                pauseTimeAfter: PAUSE_AFTER
+                pauseTimeAfter: PAUSE_AFTER,
+                maxRatioDriftPerDayBps: DRIFT_BPS_PER_DAY
             })
         );
     }
